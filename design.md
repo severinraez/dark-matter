@@ -91,8 +91,9 @@ entries of several subjects at once.
 
 The two axes (target × subject) are independent; every combination is meaningful.
 
-> **TBD:** subject enum is fixed for v1. Whether to allow an extensible/`general`
-> fallback is deferred (see §11).
+> **Decision:** the subject enum is closed — no extensible/`general` fallback. Every
+> note commits to one of the defined subjects; a forced choice keeps ranking and
+> disclosure meaningful and avoids a catch-all bucket that erodes the taxonomy.
 
 ### 2.4 Architecture notes (Option 1)
 Architecture knowledge is cross-cutting — "referred to by multiple files/folders" —
@@ -122,8 +123,10 @@ time** — dm grabs a couple more bits when minting if the prefix already exists
 agent therefore always sees a stable, reusable handle; ambiguity is resolved once, at
 write time, never surprising a later command.
 
-> **TBD:** exact id scheme (ULID vs content-hash) and the base length. 6 base32 chars is
-> the working assumption.
+> **Decision:** internal ids are **ULIDs** — globally unique without coordination,
+> lexicographically sortable by creation time (a natural tiebreak), and independent of
+> content so a supersede keeps the entry's id. The `#a3f9c1` handle is a 6-char base32
+> prefix of the ULID, extended on the rare write-time collision as above.
 
 ---
 
@@ -147,9 +150,13 @@ Execution is **two-phase**:
    individual write failures print their own error inline while other commands still
    apply.
 
-> **TBD:** multi-line note bodies. The original sketch used trailing `\` line
-> continuation; the exact escaping rule (how `:` and newlines inside a body are
-> delimited from the grammar) needs to be pinned down.
+> **Decision:** the body is always the **last field** of a command, so once the first
+> line is parsed we know exactly where the body starts — everything from there to the
+> end of the command is body. Consequences: `:` inside a body needs **no escaping** (all
+> preceding separators are consumed positionally before the body begins), and the body
+> may span multiple physical lines. The **only** escaped character is the line separator
+> that divides commands: a body newline is written as a trailing `\` continuation, so a
+> command runs until the first line **not** ending in `\`.
 
 ### 3.2 Command grammar
 
@@ -162,8 +169,11 @@ Execution is **two-phase**:
 | `u` | `u:#handle:body`        | supersede an entry's body                |
 | `d` | `d:#handle`             | tombstone an entry                       |
 | `f` | `f:#handle:sig[:reason]`| feedback (`sig` ∈ `+` `-` `!`)           |
+| `k` | `k:#handle`             | confirm stale note still valid; re-anchor|
 | `mv`| `mv:old:new`            | relocate a node's notes to a new path    |
 | `rm`| `rm:path`               | tombstone all entries homed at a path    |
+| `al`| `al:#a:#b[:note]`       | add link between two entries, opt comment|
+| `dl`| `dl:#a:#b`              | delete a link between two entries        |
 
 ### 3.3 Output format
 One block per command, in input order. Blocks are delimited by single **sentinel
@@ -198,8 +208,10 @@ rest is raw content; `◾` closes the stream.
 Write acks are one line: `+ #handle created`, `✓ #handle superseded (rev N)`,
 `✓ #handle tombstoned`, `✓ #handle feedback +`, or `✗ #handle <error>`.
 
-> **TBD:** final choice of visible glyphs used *inside* content (match markers `⟪…⟫`,
-> the `→ ↑ ← ★` glyphs) — pick for minimal tokenization cost at implementation time.
+> **Decision:** use the Unicode structure glyphs (`→` link, `↑` parent, `←` linked-from,
+> `★` arch, `⚠` stale) — visually unambiguous and collision-proof against content. **Match
+> markers are dropped entirely**: search snippets carry no in-content highlighting, so no
+> glyph ever needs escaping inside a body. The agent already has the term it searched for.
 
 ### 3.4 Error reporting
 - **Batch-level** syntax failure → a single `◾`… no: a single `!` line at the head of
@@ -252,18 +264,22 @@ inventory** (which subpaths carry notes, counts by subject), not the child notes
 
 ### 4.5 Context search (`s`)
 `s:path:t1|t2` searches the file's **entire read-context** (its own notes + all parent
-folder notes + linked concepts) for any term (`|` = OR), returning matches as handles +
-snippets. This is the escape hatch when a file sits under many arch notes: grep the
-assembled context instead of expanding every parent.
+folder notes + linked concepts), returning matches as handles + snippets. This is the
+escape hatch when a file sits under many arch notes: grep the assembled context instead
+of expanding every parent. Terms combine with `|` = **OR** and `+` = **AND**; `+` binds
+tighter, so `a+b|c` reads as `(a AND b) OR c` — an entry matches if any OR-group has all
+its `+`-joined terms present.
 
 ```
 ▸s:db/schema.rb:tenant|isolation
-#a3f9c1 c db/schema.rb …single-table inheritance for ⟪tenant⟫s… (+1 more)
-#f22e90 a api/ …enforces ⟪tenant⟫ scoping…
+#a3f9c1 c db/schema.rb …single-table inheritance for tenants… (+1 more)
+#f22e90 a api/ …enforces tenant scoping…
 2 matches · searched 5 entries in context
 ```
 
-> **TBD:** `AND` search (space/`+`) and whole-store search (`s::term`) are deferred (§11).
+> **Decision:** `AND` (`+`) is in for v1, as above. **Whole-store search** (`s::term`
+> across the entire tree, ignoring context scope) is **dropped** — `s` is always
+> context-scoped; a global grep is out of scope, not merely deferred.
 
 ### 4.6 Ranking
 When more fits than the budget allows, order by: **proximity** (closer ancestors first)
@@ -277,12 +293,14 @@ join the ranking.
 
 ## 5. CRUD & the Append-Only Log
 
-### 5.1 create / supersede / tombstone
-To keep merge = deterministic union, `u`/`d` never mutate in place. They append log
+### 5.1 create / supersede / tombstone / keep
+To keep merge = deterministic union, `u`/`d`/`k` never mutate in place. They append log
 records against the logical entry; current state is a fold of that entry's log:
 - `a` → append a **create** (`CR`) record — mints a new id/handle,
 - `u:#handle:body` → append a **supersede** (`SU`) record — same handle, new revision,
-- `d:#handle` → append a **tombstone** (`TB`) record — handle resolves to deleted.
+- `d:#handle` → append a **tombstone** (`TB`) record — handle resolves to deleted,
+- `k:#handle` → append a **re-anchor** (`RA`) record — re-stamps the staleness anchor
+  to the current blob SHA, **no new body revision** (§7.5), so churn stats stay clean.
 
 ### 5.2 Handle stability
 The handle addresses the **logical entry**, not a revision or a position, so it is
@@ -292,6 +310,13 @@ stable through supersedes, tombstones, and merges. `#a3f9c1` always means the sa
 There is **no dedicated dedup / duplicate signal**. If the agent finds redundant notes,
 it collapses them with plain CRUD (`u` to fold content into one, `d` to tombstone the
 other).
+
+### 5.4 Links
+Links follow the same append-only discipline and are the **only** way to relate entries:
+- `al:#a:#b[:note]` → append a **link** (`LN`) record — directed `#a → #b`, optional comment,
+- `dl:#a:#b` → append an **unlink** (`UL`) record — the pair's current state is LWW.
+Links are never edited inside a body (§7.3); back-links are the inverse index (§7.3),
+so a link surfaces identically at both endpoints and survives supersede/move/merge.
 
 ---
 
@@ -376,13 +401,27 @@ the knowledge stays diff-quiet — churn is confined to the header lines.
 
 ### 7.3 Body schema
 Append log of records, each carrying its own record-id (for union merge):
-- `CR <entry-id> <subj> <content-hash> <body>` — create,
-- `SU <entry-id> <subj> <content-hash> <body>` — supersede,
+- `CR <entry-id> <subj> <blob-sha> <body>` — create,
+- `SU <entry-id> <subj> <blob-sha> <body>` — supersede,
 - `TB <entry-id>` — tombstone,
+- `RA <entry-id> <blob-sha>` — re-anchor: re-stamp the staleness anchor only (§7.5),
 - `MV <from-path> <to-path>` — relocate: entries at `<from-path>` belong at
   `<to-path>` (§8.4). Path-scoped, not entry-scoped; applied as a sweep during the
   merge fold, not a per-entry edit.
-Links are carried on the entry.
+- `LN <from-#> <to-#> [comment]` — link, with optional comment,
+- `UL <from-#> <to-#>` — unlink.
+Links are their own append-only records — never a field edited inside a body — so they
+merge by union like everything else. The `al`/`dl` commands are the **only** way to
+manage links and the sole writers of `LN`/`UL` records; a link's current state folds
+from those records (LWW on the pair key, §8.2). Back-links (`← linked-from`) are the
+inverse index, computed on read.
+
+**Decision — staleness anchor.** The `<blob-sha>` on `CR`/`SU` is the git blob SHA of
+the described file at write time (`git rev-parse HEAD:path`) — git's own content address,
+so no separate hashing pass. The current anchor folds as a **LWW register** from the
+entry's `CR`/`SU`/`RA` records. It is re-stamped **only** by a deliberate write —
+`a`, `u`, or `k` — never by merge, which would re-bless a note as fresh without anyone
+confirming it still matches the code (§7.5).
 
 **Decision — concurrent supersede.** When two branches supersede the same entry
 concurrently, the current body resolves **last-write-wins** (timestamp + replica-id
@@ -400,30 +439,53 @@ an intermediate path — including ones a branch added there *unaware of the mov
 the terminal path, which then unions by handle. This composes correctly no matter which
 branch each hop came from, because the hops are just unioned log records.
 
-> **TBD:** where links live in the record (inline field vs separate `LN` records).
->
-> **TBD:** two edges of per-file provenance — a **cycle guard** for pathological
-> concurrent moves (`a→b` vs `b→a`, which would loop the fixpoint chase), and the fact
-> that `rm`-ing a terminal file discards its chain, so a much-later add at an old path
-> orphans and falls back to post-merge `dm pre-commit` (acceptable, graceful).
+**Decision — cycle guard.** Pathological concurrent moves (`a→b` vs `b→a`) could loop
+the fixpoint chase. The transitive close tracks visited paths; if the chain revisits a
+path, it stops and picks the cycle's terminal by the **same LWW total order** used
+everywhere else (highest `t` + replica-id tiebreak among the `MV` records in the cycle).
+Every replica computes the identical winner, so it collapses deterministically with no
+new rule.
+
+**Decision — `rm` discards the chain (accepted degradation).** `rm`-ing a terminal file
+tombstones its accumulated `MV` provenance with it, so a much-later add at a now-orphaned
+old path has nothing to redirect. This is caught by post-merge `dm pre-commit` (§8.4),
+which already demands the agent resolve orphans — a graceful one-step fallback, and
+correct behavior anyway since the path's whole lineage is genuinely gone.
 
 ### 7.4 Replica identity
 G-Counters need a stable per-clone **replica id**, kept in **local config**
-(`.dm/replica`, gitignored) so it never merges. Short (3–4 base32 chars, derived from
-`git config user.email` + a local salt) to keep header cells tiny.
+(`.dm/replica`, gitignored) so it never merges. A wide random value (8 base32 chars from
+a CSPRNG at `dm init`) so collisions never need coordinating.
 
-> **TBD:** derivation + collision handling across a team at that length.
+> **Decision:** spend the bytes rather than fight collisions. The replica id is a wide
+> random value (e.g. 8 base32 chars from a CSPRNG at `dm init`, not derived from
+> `user.email`) so collision across any realistic team is negligible and needs no
+> registry or coordination. The cost is a few extra bytes per populated G-Counter cell,
+> which is cheap next to the note bodies and compresses well in git.
 
-### 7.5 Staleness hashing
-Each entry records the **content-hash of the file (or region)** it describes at write
-time. On read, if the current file has drifted, the entry is flagged `⚠stale`. Cheap,
-high trust value.
+### 7.5 Staleness anchor
+Each entry records the **git blob SHA** of the file it describes at write time
+(`git rev-parse HEAD:path`). On read, `dm` compares it to the file's current blob SHA;
+a mismatch flags the entry `⚠stale`, and ranking (§4.6) sinks stale below fresh. Using
+git's own content address means no separate hashing pass, a self-contained per-file
+anchor (no cross-branch history dependency), and a trivial merge rule — the anchor rides
+`CR`/`SU`/`RA` and folds LWW (§7.3).
 
-> **TBD:** hash granularity — whole-file only (robust) vs region/line (richer but rots).
-> Working assumption: whole-file for v1, matching file-level note granularity.
->
-> **TBD:** the staleness concept as a whole is up for revisit later (see §11) — whether
-> hash-drift is the right trust signal at all, not just its granularity.
+**Decision — granularity.** Whole-file, matching file-level note granularity. A region/
+line anchor would be more precise but rots (line ranges shift under edits); whole-file is
+robust and cheap. The cost — any edit anywhere in a file flags all its notes — is
+absorbed by the housekeeping flow (§8.4): re-blessing via `k` is a one-liner, and the
+stale worklist is scoped to files the session actually touched.
+
+**Decision — treatment.** A stale note is reconciled by the agent, never by dm, one of
+three ways: `k` (still valid → re-anchor), `u` (partly wrong → rewrite, re-anchors), or
+`d` (obsolete → tombstone). The `dm pre-commit` gate (§8.4) drives this at session end.
+
+**Accepted limitation.** Blob-SHA drift detects that *the file's bytes changed*, not that
+*the note became wrong* — the two overlap but differ. So false positives (a reformat or
+unrelated edit flags a still-valid note) and false negatives (a note rots while its file
+is untouched) both exist. This is accepted for v1: `k` is the escape valve for the false
+positive, and no cheaper signal with better fidelity is on offer. Not revisited further.
 
 ---
 
@@ -476,8 +538,12 @@ Per file, both regions merge with no human conflict:
 The three-way base is the merge-base of the two `-llm` branch tips (standard git
 ancestor), so deletes/tombstones and additions are distinguished correctly.
 
-> **TBD:** the `SU`-vs-`SU` concurrent-supersede resolution rule (see §7.3).
->
+Single-valued fields that can be concurrently written resolve **last-write-wins** on
+the `t`/replica-id total order: the header `t` register and the current body of an entry
+superseded on both sides (**`SU`-vs-`SU`**, decided in §7.3 — both `SU` records survive
+in the log, the loser becomes a sibling revision). The move-path redirect map composes
+by fixpoint (§7.3) rather than LWW.
+
 > **TBD (optional):** also register a `.gitattributes` merge driver as a safety net so a
 > *raw* `git merge` of shadow branches stays deterministic too, even when the user
 > bypasses `dm merge`. Not required for the primary path.
@@ -517,6 +583,17 @@ branch. Reconciling on every commit keeps the shadow tree consistent with the co
 which is what makes the deterministic merge tractable: both sides of a merge are
 self-consistent snapshots.
 
+**Decision — the gate also covers staleness (§7.5).** Besides orphans, `dm pre-commit`
+emits a **stale worklist**: notes whose blob-SHA anchor no longer matches the current
+file. It is **scoped to the working set** — only notes homed on code files this branch
+changed (diff vs the merge-base) — so the list is short and every item is one the agent
+has fresh context to judge. Notes on untouched files stay flagged on read but never enter
+the gate. Each stale note is resolved with `k` (still valid → re-anchor), `u` (rewrite),
+or `d` (tombstone). Both worklists are a **hard gate**: `dm pre-commit` exits non-zero
+until every orphan *and* every scoped-stale note is resolved. Scoping is what earns the
+hard gate — it makes the list actionable rather than noise, so "reconcile the
+consequences of what you changed this session" applies uniformly to moves and drift.
+
 **Decision — concurrent moves.** A move writes a mergeable **`MV` record** (§7.3)
 naming the prior path; the merge **follows the entry handle, not the path**, and
 consolidates all of an entry's records at the **newest path** — the destination of the
@@ -528,8 +605,9 @@ only as **internal merge metadata**, never an agent-facing redirect: reads never
 resolve an old path (§4), and once an `MV` record sinks below the merge-base of all
 live branches it is compacted away (§11), like a tombstone.
 
-> **Decided:** `dm pre-commit` reports **orphans only**. Detecting *new* code files
-> with no shadow node (to nudge note-taking) is out of scope for v1.
+> **Decided:** `dm pre-commit` reports **orphans and scoped-stale notes** (both a hard
+> gate). Detecting *new* code files with no shadow node (to nudge note-taking) is out of
+> scope for v1.
 
 ---
 
@@ -608,11 +686,11 @@ snapshot merge results; devs use it to inspect what actually landed.
 - **team-shared vs per-clone stats** — already merged via CRDT header; revisit if
   per-clone granularity turns out to matter.
 - **duplicate signal** — none for v1; agent cleans up via CRUD.
-- **AND-search / whole-store search** — `s` is OR + context-scoped for v1.
+- **whole-store search** — dropped, not deferred: `s` is always context-scoped
+  (`AND`/`OR` both land in v1, §4.5).
 - **oversized-entry pagination** — expansion returns full body for v1; paginate huge
   entries later with a continuation handle.
 - **extensible subjects** — fixed c/a/d/o enum for v1.
-- **staleness concept** — revisit the whole model (§7.5): whether content-hash drift is
-  the right trust signal at all, its granularity (whole-file vs region), and its
-  interaction with moves (a move preserves the hash, so it correctly does *not* flag
-  stale — but this needs confirming once the move representation lands).
+- **staleness fidelity** — *not* deferred; settled as an **accepted limitation** (§7.5):
+  blob-SHA drift detects byte-change, not wrongness, so false positives/negatives exist
+  and are lived with. Listed here only so the known gap is on the record.
