@@ -37,6 +37,11 @@ agent accumulates and wants back later, on the right branch, without re-deriving
 - **Replica** — a single clone/agent, identified by a local id, for CRDT counters.
 - **Subject** — the kind of knowledge a note carries: code / architecture /
   development / operations.
+- **LWW register** — a single-valued field merged **last-write-wins**: when two
+  branches set it concurrently, the merge keeps the value with the higher timestamp
+  (wall-clock + replica-id tiebreak, a total order so every replica picks the same
+  winner) and discards the other. Used for `t`; everything else in the header is a
+  set/counter that unions.
 
 ---
 
@@ -157,6 +162,8 @@ Execution is **two-phase**:
 | `u` | `u:#handle:body`        | supersede an entry's body                |
 | `d` | `d:#handle`             | tombstone an entry                       |
 | `f` | `f:#handle:sig[:reason]`| feedback (`sig` ∈ `+` `-` `!`)           |
+| `mv`| `mv:old:new`            | relocate a node's notes to a new path    |
+| `rm`| `rm:path`               | tombstone all entries homed at a path    |
 
 ### 3.3 Output format
 One block per command, in input order. Blocks are delimited by single **sentinel
@@ -371,12 +378,34 @@ the knowledge stays diff-quiet — churn is confined to the header lines.
 Append log of records, each carrying its own record-id (for union merge):
 - `CR <entry-id> <subj> <content-hash> <body>` — create,
 - `SU <entry-id> <subj> <content-hash> <body>` — supersede,
-- `TB <entry-id>` — tombstone.
+- `TB <entry-id>` — tombstone,
+- `MV <from-path> <to-path>` — relocate: entries at `<from-path>` belong at
+  `<to-path>` (§8.4). Path-scoped, not entry-scoped; applied as a sweep during the
+  merge fold, not a per-entry edit.
 Links are carried on the entry.
 
-> **TBD:** where links live in the record (inline field vs separate `LN` records), and
-> the `SU` conflict rule when two branches supersede the same entry concurrently
-> (keep-both fork vs logical-clock last-writer).
+**Decision — concurrent supersede.** When two branches supersede the same entry
+concurrently, the current body resolves **last-write-wins** (timestamp + replica-id
+tiebreak, §8.2), consistent with the `t` and move-path registers. Both `SU` records
+survive in the log — the loser becomes a sibling revision, never a git conflict — so
+nothing is destroyed and churn stats stay accurate. No keep-both fork is surfaced; the
+merge always yields one clean current body.
+
+**Decision — `MV` lives on the destination file.** A move carries the whole note-file
+log to the new path and appends `MV <from> <to>`, so a file that moved `a→b→c`
+accumulates both `MV a b` and `MV b c` in its own log — the full provenance chain
+travels with the file. On merge, the union of all `MV` records forms a redirect map
+chased to a **fixpoint** (transitively composing `a→b→c`), sweeping any entries left at
+an intermediate path — including ones a branch added there *unaware of the move* — to
+the terminal path, which then unions by handle. This composes correctly no matter which
+branch each hop came from, because the hops are just unioned log records.
+
+> **TBD:** where links live in the record (inline field vs separate `LN` records).
+>
+> **TBD:** two edges of per-file provenance — a **cycle guard** for pathological
+> concurrent moves (`a→b` vs `b→a`, which would loop the fixpoint chase), and the fact
+> that `rm`-ing a terminal file discards its chain, so a much-later add at an old path
+> orphans and falls back to post-merge `dm pre-commit` (acceptable, graceful).
 
 ### 7.4 Replica identity
 G-Counters need a stable per-clone **replica id**, kept in **local config**
@@ -392,6 +421,9 @@ high trust value.
 
 > **TBD:** hash granularity — whole-file only (robust) vs region/line (richer but rots).
 > Working assumption: whole-file for v1, matching file-level note granularity.
+>
+> **TBD:** the staleness concept as a whole is up for revisit later (see §11) — whether
+> hash-drift is the right trust signal at all, not just its granularity.
 
 ---
 
@@ -460,15 +492,92 @@ between flushes live in the working tree.
 > **TBD:** the exact flush trigger and whether stats get their own commit vs riding
 > content commits.
 
+### 8.4 Renames & orphaned notes — agent-driven reconciliation
+
+**Decision:** the **agent tracks renames**, not dm. dm does not watch the code tree
+or run git rename detection; instead it provides a **pre-commit gate** that forces
+the agent to reconcile the shadow tree against the code tree before every shadow
+commit.
+
+**`dm pre-commit`** compares the shadow tree against the current code working tree
+and lists every **orphaned node** — a note-bearing path (file or folder) whose mirror
+path no longer exists in the code tree. It exits non-zero while any orphan is
+unresolved, so the agent must act. Each orphan is resolved one of two ways:
+
+- **`mv:old:new`** — the code moved; relocate the node's notes to the new mirror
+  path. Entry handles are preserved (§5.2), so links and back-links survive.
+- **`rm:path`** — the code was genuinely deleted; tombstone the node's entries. This
+  is the node-level counterpart to `d:#handle` (which tombstones one entry): it
+  tombstones every entry homed at a vanished path in one move.
+
+`mv` and `rm` are ordinary **batch-stdin commands** (§3.2) — the agent feeds them into
+a `dm` batch like any read or write. `dm pre-commit` is a **subcommand** (like `dm
+merge`): the gate itself, run at the end of a work session before committing the `-llm`
+branch. Reconciling on every commit keeps the shadow tree consistent with the code tree,
+which is what makes the deterministic merge tractable: both sides of a merge are
+self-consistent snapshots.
+
+**Decision — concurrent moves.** A move writes a mergeable **`MV` record** (§7.3)
+naming the prior path; the merge **follows the entry handle, not the path**, and
+consolidates all of an entry's records at the **newest path** — the destination of the
+most recent move, resolving conflicting destinations (`a→b` vs `a→c`) by the same LWW
+rule as `t` (§8.2). The `MV` record is what makes move-vs-edit safe: a branch that
+added notes at the old path *unaware of the move* has them swept to the new path on
+merge instead of orphaning at a dead location. So a "moved" pointer does survive — but
+only as **internal merge metadata**, never an agent-facing redirect: reads never
+resolve an old path (§4), and once an `MV` record sinks below the merge-base of all
+live branches it is compacted away (§11), like a tombstone.
+
+> **Decided:** `dm pre-commit` reports **orphans only**. Detecting *new* code files
+> with no shadow node (to nudge note-taking) is out of scope for v1.
+
 ---
 
 ## 9. Testing
 
 ### 9.1 E2E harness
-Tests set up a **real temporary git repo**, drive `dm` via stdin, and assert on both
-stdout and the resulting shadow-tree state. This is the primary test strategy.
+Tests set up a **real git repo**, drive `dm` via stdin, and assert on both stdout and
+the resulting shadow-tree state. This is the primary test strategy.
 
-### 9.2 Scenarios
+### 9.2 Fixture repo & the base branch
+All scenarios branch off a single **well-known base**: `base` (code) + `base-llm`
+(shadow, pre-seeded with a known note set). Branching off a shared base means every
+scenario inherits identical handles, paths, and stats, so per-scenario setup is one
+checkout, not a long command script — and discovery/merge tests stop depending on the
+write commands being correct just to reach their starting state.
+
+The fixture is **built by a command** (`dm fixture build`) from a single declarative
+manifest — code tree + notes + seeded stats — so a storage-format change is absorbed in
+one place. It deliberately exercises every disclosure dimension so discovery tests just
+reuse it: a file with mixed-subject own notes; a nested folder tree (≥2 ancestor
+levels); an architecture note at an LCA folder linking members (back-links); an entry
+with pre-seeded stats (ranking + `⚠disputed`); a hash-drifted entry (`⚠stale`); a
+superseded entry (rev ≥2) and a tombstoned one; and a two-replica header (G-Counter
+merge). Where possible it reuses the worked examples from §3–§6 (`api/handler.rb`, the
+`api/` arch note `#f22e90`, `db/schema.rb #a3f9c1`) so the doc's illustrative output is
+literal golden output.
+
+**Guard tests.** Because the fixture is built *through* `dm` (`a` etc.) rather than
+seeded at the storage layer, a small set of guard tests asserts that the build commands
+themselves work. A regression in `a` then surfaces as a focused guard failure, not as
+every scenario mysteriously breaking.
+
+**Isolation: worktree-per-test.** Each scenario runs in its own `git worktree` off the
+fixture, so tests cannot mutate the shared base and can run in parallel.
+
+**Determinism.** The harness pins every source of nondeterminism — fixed replica id, a
+seeded/deterministic id source, an injectable clock (so LWW `t` is assertable), and
+stable sort order — otherwise none of the golden output is reproducible.
+
+### 9.3 `dm dump`
+`dm dump [path]` prints the **full raw state** of the shadow tree — every note file's
+header (per-replica counters, `t`) and body (the append-log with resolved handles) — in
+a deterministic, un-budgeted, unranked, human/test-readable form. It is the opposite of
+the agent-facing read (§3.3): no progressive disclosure, no size hints, no ranking, just
+the ground truth on disk. Tests use it to assert shadow-tree state structurally and to
+snapshot merge results; devs use it to inspect what actually landed.
+
+### 9.4 Scenarios
 - **CRUD** — create/supersede/tombstone; handle stability across revisions.
 - **Discovery** — surface previews, cost hints, drill-by-handle, depth modifier, search.
 - **Two-phase** — syntactically bad batch writes nothing; per-command errors isolated.
@@ -476,6 +585,9 @@ stdout and the resulting shadow-tree state. This is the primary test strategy.
 - **Merge** — deterministic merge produces no conflict; body union + header counter merge.
 - **Determinism** — same inputs, different orders/replicas → identical merged result.
 - **Stats merge** — G-Counters sum across replicas; LWW timestamp picks the max.
+- **Renames** — `dm pre-commit` lists orphans; `dm mv` relocates notes preserving
+  handles/links; `dm rm` tombstones a deleted node's entries.
+- **Guard** — the fixture build commands (`a`, seed path) produce the expected base.
 
 ---
 
@@ -491,7 +603,8 @@ stdout and the resulting shadow-tree state. This is the primary test strategy.
 - **budget-fill retrieval** — `r:path` auto-expands top-ranked items to fill ~N tokens;
   wait until usage-stat ranking makes "dm decides" trustworthy.
 - **compaction** — rewrite files to fold superseded revisions, drop tombstoned rows,
-  coalesce counters; must be coordinated to not lose concurrent increments.
+  prune settled `MV` records (once below the merge-base of all live branches), coalesce
+  counters; must be coordinated to not lose concurrent increments.
 - **team-shared vs per-clone stats** — already merged via CRDT header; revisit if
   per-clone granularity turns out to matter.
 - **duplicate signal** — none for v1; agent cleans up via CRUD.
@@ -499,3 +612,7 @@ stdout and the resulting shadow-tree state. This is the primary test strategy.
 - **oversized-entry pagination** — expansion returns full body for v1; paginate huge
   entries later with a continuation handle.
 - **extensible subjects** — fixed c/a/d/o enum for v1.
+- **staleness concept** — revisit the whole model (§7.5): whether content-hash drift is
+  the right trust signal at all, its granularity (whole-file vs region), and its
+  interaction with moves (a move preserves the hash, so it correctly does *not* flag
+  stale — but this needs confirming once the move representation lands).
