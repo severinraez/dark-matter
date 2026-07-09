@@ -1,8 +1,9 @@
 # Dark Matter — Design
 
-> **Status:** design draft. Decisions marked **TBD** are not yet settled; everything
-> else reflects a made decision. This document is the source of truth for the model,
-> the CLI, the storage format, and the git mechanics.
+> **Status:** design settled. Every decision below is made; there are no open **TBD**s.
+> Items intentionally punted to a later version are collected in §11 (Deferred). This
+> document is the source of truth for the model, the CLI, the storage format, and the git
+> mechanics.
 
 ---
 
@@ -337,7 +338,7 @@ exchange for stats that rank *and* travel with branches.
 | **impressions** (`i`)| times shown *collapsed* in a surface (weak)             |
 | **expansions** (`x`) | times *opened* via `r:#handle` (strong — the real click)|
 | **last-expanded**(`t`)| recency of genuine use                                 |
-| **search-hits**      | surfaced as a match by `s` (distinct from impressions)  |
+| **search-hits** (`h`)| surfaced as a match by `s` (distinct from impressions)  |
 | **revisions / churn**| volatile vs settled knowledge                           |
 | **feedback** (`+ - !`)| explicit agent signal (§6.3)                           |
 
@@ -421,8 +422,8 @@ the knowledge stays diff-quiet — churn is confined to the header lines.
 
 ### 7.2 Header schema
 - One row per logical entry, keyed by id.
-- Columns: `i` impressions, `x` expansions, `t` last-expanded, `+` `-` `!` feedback.
-  (Add `search-hits` per §6.1 TBD.)
+- Columns: `i` impressions, `x` expansions, `h` search-hits (§6.1), `t` last-expanded,
+  `+` `-` `!` feedback.
 - Each counter cell is a **G-Counter**: `A3:12,F2:4` = replica A3→12, F2→4, total 16.
   Missing field = zero.
 - `t` is a last-write-wins timestamp register.
@@ -537,11 +538,6 @@ positive, and no cheaper signal with better fidelity is on offer. Not revisited 
 
 ## 8. Git Mechanics
 
-> All of §8 is now settled: mirroring is explicit `dm` subcommands over a `dm`-managed
-> `.dm/` worktree (§8.1), companions are real `llm/*` branches (§8.1), the merge driver is
-> dropped (§8.2), the stat-flush trigger is fixed (§8.3), and the `SU`-vs-`SU` rule lives
-> in §7.3. No open TBDs remain here.
-
 ### 8.1 `-llm` branch mirroring — explicit commands
 
 **Decision:** mirroring is **explicit**. The agent/user drives the shadow branches
@@ -591,24 +587,26 @@ verbs):
 | subcommand | action |
 | --- | --- |
 | `dm init` | create `.dm/` (replica id, config) and the first, **empty** `llm/main`; add the worktree |
-| `dm checkout [B]` | point the `.dm/` worktree at `llm/<B>` (current code branch if omitted), creating it from the parent's companion if missing; flushes pending stats first |
+| `dm checkout [B]` | point the `.dm/` worktree at `llm/<B>` (current code branch if omitted), creating it from the **fork-point** companion if missing (§8.5); **requires a clean worktree** — run `dm commit` first (§8.3) |
 | `dm merge <src>` | deterministically merge the **local** `llm/<src>` into the current companion, into the worktree, **uncommitted** (§8.2); does **not** auto-fetch — run `dm fetch` first for a remote source |
-| `dm commit` | commit the companion worktree — also the explicit stat **flush** (§8.3) |
+| `dm commit` | commit the companion worktree — the **only** thing that persists notes and stat deltas (§8.3) |
 | `dm push` / `dm fetch` | move the companion ref to / from `origin` (a plain `git push` never sees `llm/*`) |
 | `dm pre-commit` | the orphan + stale reconciliation gate (§8.4) |
+| `dm unmerged` | list companions whose code branch has landed in the current one but which aren't yet folded in; follow up with `dm merge` per entry (§8.5) |
+| `dm prune <B>` | delete the landed companion `llm/<B>` (local + `origin`) and remove its `.dm/` worktree — shadow counterpart of `git branch -d B` (§8.5) |
 
 `dm init` builds the empty `llm/main` with plumbing (empty-tree → `commit-tree` →
 `update-ref`), **not** `git worktree add --orphan` (git 2.42+), to keep the version floor
 low (§10).
 
-**Decision — commit is agent-driven, merge is hands-off.** Content writes auto-commit at
-the end of their batch (§8.3); beyond that the **agent is responsible for running `dm
-commit`** to flush stats and finalize a session before `dm push`. Merging needs **no
-human**: `dm merge` is deterministic (§8.2), so the receiving side never resolves a
-conflict — after an explicit `dm fetch`, the companion merges hands-off. The merge lands as a *parallel*
-commit on `llm/<B>` in the same PR / push event as the code merge — **never the same
-commit** as the code, since it is a different branch. `dm merge` does not auto-commit; the
-uncommitted worktree state is the finished merge awaiting `dm commit`.
+**Decision — commit is agent-driven, merge is hands-off.** Nothing auto-commits: every
+write — content *and* stat deltas — accumulates in the `.dm/` worktree, and the **agent
+is responsible for running `dm commit`** to persist it (§8.3). Merging needs **no human**:
+`dm merge` is deterministic (§8.2), so the receiving side never resolves a conflict —
+after an explicit `dm fetch`, the companion merges hands-off. The merge lands as a
+*parallel* commit on `llm/<B>` in the same PR / push event as the code merge — **never the
+same commit** as the code, since it is a different branch. `dm merge` does not auto-commit
+either; the uncommitted worktree state is the finished merge awaiting `dm commit`.
 
 A missing companion bootstraps empty (a merge or branch targeting a code branch with no
 `llm/` companion yet starts from an empty shadow tree).
@@ -643,21 +641,22 @@ to `<rec-id>` order only to break a cycle.
 > never `git merge` a companion — always `dm merge`. A hosted merge button would not run
 > the driver anyway, so it was never protection on the hosted side.
 
-### 8.3 Commit cadence for stats
-Reads mutate the header, so stat writes are **coalesced and deferred**: a `dm`
-invocation applies all its deltas to the `.dm/` worktree once at the end, and dm flushes
-them into a commit lazily — piggybacked on the next content write, or forced before any
-branch/merge/push op (so nothing merges or pushes uncommitted). Pending deltas between
-flushes live in the worktree.
+### 8.3 Commit cadence — explicit `dm commit`
+Both content writes and stat deltas (reads bump the header, §7.1) accumulate in the
+`.dm/` worktree; a `dm` invocation applies all its deltas there once at the end but
+**commits nothing**. Persisting is a single explicit act: **`dm commit`**. The agent runs
+it to finalize a session and must run it before any branch/merge/push op.
 
-> **Decision — flush trigger.** Content writes (`a`/`u`/`d`/`al`/`dl`/`mv`/`rm`) **auto-
-> commit** at the end of their batch — notes are too valuable to leave uncommitted in a
-> private worktree. Stat-only deltas (reads bumping the header) are **coalesced** and
-> flushed by the next content commit, or **forced** by an explicit `dm commit` and before
-> any `dm checkout` / `dm merge` / `dm push` / `dm pre-commit`. Stats therefore ride a
-> content commit when one is available and take their own commit only when flushed alone;
-> either way churn stays on the companion branch (§7.1) and is compacted later (§11).
-> `dm commit` is the single user-facing flush — the agent runs it to finalize a session.
+> **Decision — no auto-commit.** There is **no implicit flush**: neither content writes
+> (`a`/`u`/`d`/`al`/`dl`/`mv`/`rm`) nor stat-only read deltas commit on their own. All of
+> them coalesce in the worktree and are persisted only by an explicit **`dm commit`** —
+> one commit carrying whatever content and stat deltas are pending. The agent is therefore
+> responsible for committing before it walks away; uncommitted worktree state is the
+> price of keeping `dm` free of hidden git writes. To keep the invariant "nothing merges
+> or pushes uncommitted" without magic, `dm checkout` / `dm merge` / `dm push` /
+> `dm pre-commit` **refuse on a dirty worktree** and tell the agent to `dm commit` first,
+> rather than silently committing for it. Commit churn stays on the companion branch
+> (§7.1) and is compacted later (§11).
 
 ### 8.4 Renames & orphaned notes — agent-driven reconciliation
 
@@ -709,6 +708,120 @@ live branches it is compacted away (§11), like a tombstone.
 > **Decided:** `dm pre-commit` reports **orphans and scoped-stale notes** (both a hard
 > gate). Detecting *new* code files with no shadow node (to nudge note-taking) is out of
 > scope for v1.
+
+### 8.5 Branch lifecycle — two loops
+
+The verbs above split into two cadences, and naming that split is the whole operating
+model. **`dm` is entirely agent-operated:** the developer runs `dm init` once per clone
+and otherwise does normal git; the agent drives every other `dm` op, mirroring each git
+op with its shadow counterpart *at the moment it happens* (no hooks, §8.1).
+
+- **Inner loop** — per-file, continuous, git-unaware. Read-before-touch, write-on-learn.
+  Writes accumulate uncommitted in the worktree; nothing persists until `dm commit` (§8.3).
+- **Outer loop** — per-session / per-branch, git-bound. The `checkout / pre-commit /
+  commit / push / merge / unmerged / prune` verbs fire at branch boundaries.
+
+| Lifecycle moment | Code side | Shadow side (agent runs) |
+| --- | --- | --- |
+| clone setup | `git clone` | `dm init` (once) |
+| start work on a branch | `git checkout -b topic/x` | `dm checkout` (infers branch, creates companion from fork-point if missing) |
+| working | edit + `git commit` | **inner loop**: `r:` before touching, `a`/`u`/`d`/`f`/`al` on learning |
+| wrap up / open PR | `git push` | `dm pre-commit` → resolve orphans (`mv`/`rm`) + scoped-stale (`k`/`u`/`d`) → `dm commit` → `dm push` |
+| land locally | `git merge topic/x` into `main` | `dm merge llm/topic/x` → `dm commit` → `dm push` → `dm prune topic/x` |
+| land via hosted button | PR merged remotely | (later, on `llm/main`) `dm unmerged` → `dm merge` each → `dm commit` → `dm push` → `dm prune` |
+
+**Inner-loop discipline.**
+1. **Read before touching** a file: `r:path` for the surface, `r:path:1` to orient with
+   parent/arch notes inline, or `s:path:t1|t2` to grep the assembled context when a file
+   sits under many arch notes.
+2. **Write when you learn something durable** you'd want back on this branch later — a
+   gotcha, a non-obvious constraint, a why-it's-this-way — not a restatement of code.
+3. **Correct what you find wrong**: `u` to fix, `d` to remove, `f:#h:!:reason` to flag
+   when you can't fix now, `k` to re-bless a stale-flagged note you've verified.
+
+**Decision — companion parent on `dm checkout`.** When `dm checkout` must create a
+missing `llm/<B>`, it branches from the companion of `B`'s **fork-point** — the branch
+`B` was created from, found via `git merge-base` against the configured base branches
+(default just `main`); the companion of the nearest such base is the parent, falling back
+to an **empty** shadow tree if none is found. So a topic branched off another topic
+inherits the parent topic's notes, while a topic off `main` inherits `llm/main`.
+
+**Decision — `dm unmerged` lists what to fold.** The founding invariant (§2.1) requires
+every code merge into `main` to be mirrored by `llm/<B>` → `llm/main`. Local merges are
+mirrored directly (`dm merge` right after `git merge`). Merges via a **hosted PR button**
+are observed by no local agent, so — run on `llm/main` after pulling `main` — `dm
+unmerged` **lists** every companion `llm/<B>` whose code branch `B` has landed in `main`
+but whose notes are not yet in `llm/main`. It does **not** fold anything itself: the agent
+follows up with `dm merge llm/<B>` per listed entry, then `dm commit` → `dm push` →
+`dm prune <B>`. Keeping detection (`unmerged`) separate from the mutation (`merge`) keeps
+`dm` free of the one hands-off write the rest of the model avoids, and lets the agent skip
+a companion it recognizes as abandoned.
+
+**Detection under rebase/squash.** Hosted providers often **rebase or squash** before
+merging, so `B`'s commits are rewritten and `B`'s tip is *not* an ancestor of `main` —
+`git branch --merged` misses it. `dm unmerged` therefore does **not** rely on code-side
+ancestry: the practical "merged" signal is that **the code branch `B` no longer exists on
+`origin`** (hosts delete the source branch on merge), optionally corroborated by `git
+branch --merged` for true-merge flows. Because the fold is an **idempotent CRDT union**
+(§8.2), acting on a false positive is cheap — folding a companion whose code has not yet
+landed only surfaces its notes early, and a re-fold after the real merge yields the
+identical result. The residual hazard is an **abandoned** branch, which is why `unmerged`
+only *lists* and the agent decides; and it lists only companions whose code branch was
+*deleted* (merged), never one still present on `origin`. The CI end state (§11) sidesteps
+detection entirely: the merge event names the source branch, so CI can `dm merge
+llm/<that>` directly regardless of rebase/squash.
+
+**Decision — `dm prune <B>`.** After `llm/<B>` is folded into `llm/main`, `dm prune <B>`
+deletes the companion branch (local + `origin`) and removes its `.dm/` worktree — the
+shadow counterpart of `git branch -d B`. Always agent-invoked, one companion at a time.
+
+### 8.6 Agent integration — the `agents.md` prompt
+
+This is the canonical block a consuming repo copies into its own `AGENTS.md` so the agent
+reads `dm` output correctly and follows the lifecycle. It is deliberately concise.
+
+> #### Dark Matter (`dm`) — your memory about this codebase
+>
+> `dm` stores notes *about* the code (gotchas, architecture rationale, dev/ops know-how)
+> on a shadow git branch that tracks your current branch. Read before you touch a file;
+> write when you learn something you'd want back later.
+>
+> **Read first.** Before editing `foo/bar.rb`: `r:foo/bar.rb` returns a *surface* — own
+> notes (one-line previews), parent/arch notes, links, and an inventory footer. It's a
+> map, not a dump. Drill with `r:#handle` (full body of one entry) or `s:foo/bar.rb:t1|t2`
+> (grep the file's whole note-context; `|`=OR, `+`=AND).
+>
+> **Write on learning.** `a:path:subj:body` (subj: `c` code/behavior · `a` architecture ·
+> `d` dev/build/test · `o` ops). `u:#handle:body` supersedes · `d:#handle` removes ·
+> `k:#handle` re-blesses a stale note · `f:#handle:!:reason` flags one wrong.
+>
+> **Link related notes.** Links are the only way notes relate — `al:#a:#b[:why]` connects
+> two entries (directed `a→b`, optional comment); `dl:#a:#b` removes one. Link a note to
+> the ones it depends on, contradicts, or elaborates: an architecture note (`a`) links to
+> the files it governs so they surface it as `← linked-from`; a gotcha links to the note
+> explaining the underlying cause. Follow any `→`/`←` you see with `r:#handle`.
+>
+> **Output.** Blocks split on `▸` (command echo, then raw content); `◾` ends the stream.
+> Glyphs: `→` link · `↑` parent note · `←` linked-from · `⚠stale` (file changed since the
+> note) · `⚠disputed` (flagged wrong). `(+N lines)` = hidden size. Handles `#a3f9c1` are
+> stable — copy them into later commands.
+>
+> **Batch over stdin**, one command per line, body always last (`:` in a body needs no
+> escaping; trailing `\` continues to the next line):
+> ```
+> dm <<EOF
+> r:api/handler.rb
+> a:api/handler.rb:c:Validates tenant header before dispatch
+> EOF
+> ```
+>
+> **Session lifecycle** — mirror your git ops: start / new branch → `dm checkout`; before
+> a PR → `dm pre-commit` (resolve orphans with `mv`/`rm`, stale notes with `k`/`u`/`d`)
+> then `dm commit` then `dm push`; when your branch merges to `main` → `dm merge
+> llm/<branch>` then `dm commit && dm push` (after a hosted merge, run `dm unmerged` on
+> `llm/main` and `dm merge` each listed companion). **Nothing persists until you run `dm
+> commit`** — it saves both your notes and read-stats, so commit before any merge/push and
+> at session end.
 
 ---
 
@@ -799,6 +912,12 @@ snapshot merge results; devs use it to inspect what actually landed.
 - **oversized-entry pagination** — expansion returns full body for v1; paginate huge
   entries later with a continuation handle.
 - **extensible subjects** — fixed c/a/d/o enum for v1.
+- **CI-driven merge-to-main** — v1 reconciles hosted PR-button merges with the local
+  `dm unmerged` + `dm merge` flow (§8.5); the scalable end state is a CI job on code
+  `main` that folds the merged branch's companion into `llm/main` headless. CI sidesteps
+  rebase/squash detection entirely — the merge event names the source branch, so it runs
+  `dm merge llm/<that>` directly. Deferred: it's infra, and the job must be scoped so `llm/*` pushes
+  don't themselves trigger pipelines (§8.1).
 - **staleness fidelity** — *not* deferred; settled as an **accepted limitation** (§7.5):
   blob-SHA drift detects byte-change, not wrongness, so false positives/negatives exist
   and are lived with. Listed here only so the known gap is on the record.
