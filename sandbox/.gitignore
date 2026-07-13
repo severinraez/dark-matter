@@ -1,0 +1,3 @@
+# The sandbox container's own state: claude config/session history and the Go
+# module/build caches, bind-mounted in at run time. Rebuildable; never committed.
+.state/

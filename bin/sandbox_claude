@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# Launch Claude Code inside a sandboxed container, with permission checks bypassed,
+# to develop this repo.
+#
+# Isolation contract — the container gets exactly this and nothing more:
+#
+#   mounted   : this repo at /workspace (rw), plus the container's own state under
+#               sandbox/.state/ (untracked) — claude's config and the Go module/build
+#               caches, so they survive across runs. .state/claude is NOT the host's
+#               ~/.claude: it starts empty, and holds only what the sandbox itself
+#               writes (a /login credential, session history). `rm -rf sandbox/.state`
+#               resets the sandbox to nothing.
+#   passed    : CLAUDE_CODE_OAUTH_TOKEN, your git name+email, TERM
+#   NOT passed: ~/.ssh, ~/.gitconfig, ~/.aws, ~/.config/gh, /var/run/docker.sock,
+#               --network host, or any other host env (docker forwards none by default)
+#
+# Consequence: the agent can edit, build, test, and commit this repo, and can create
+# throwaway git repos for the e2e harness — but it holds no key for `origin` (an SSH
+# remote), so it cannot push. Publishing stays a human act on the host.
+#
+set -euo pipefail
+
+IMAGE=dark-matter-sandbox
+TOKEN_FILE="${DM_SANDBOX_ENV_FILE:-$HOME/.config/dark-matter/sandbox.env}"
+
+REPO="$(git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)"
+STATE="$REPO/sandbox/.state"
+
+usage() {
+    cat <<EOF
+usage: bin/sandbox_claude [--shell | --login | --rebuild | --help] [claude args...]
+
+  (no flags)   start claude in the sandbox, permissions bypassed
+  --shell      drop into bash in the sandbox instead, to inspect it
+  --login      start claude with no token, so an interactive /login persists
+               into sandbox/.state/claude/ and is reused on later runs
+  --rebuild    rebuild the image from scratch (--no-cache --pull); this is how you
+               pick up a newer Claude CLI, which the layer cache would otherwise pin
+
+The sandbox's own state (claude config, Go caches) lives in the untracked directory
+sandbox/.state/. Delete it to reset the sandbox completely.
+
+Authentication — mint a long-lived (1 year) token once on the host:
+
+    claude setup-token
+
+  then store it, outside the repo, so it can never be committed:
+
+    install -Dm600 /dev/null "$TOKEN_FILE"
+    printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' '<token>' >> "$TOKEN_FILE"
+
+  The container is handed the value, never the file. If no token is found, the
+  fallback is --login. On this host the CLI is not on PATH; it ships with the VS Code
+  extension:
+
+    ~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude
+EOF
+}
+
+mode=claude
+build_args=()
+
+case "${1:-}" in
+    --help | -h)
+        usage
+        exit 0
+        ;;
+    --shell)
+        mode=shell
+        shift
+        ;;
+    --login)
+        mode=login
+        shift
+        ;;
+    --rebuild)
+        build_args=(--no-cache --pull)
+        shift
+        ;;
+esac
+
+# Docker's layer cache already keys on content, so an unconditional build is a
+# sub-second no-op once warm, and any edit to Dockerfile/entrypoint.sh rebuilds
+# exactly the layers it touched.
+docker build -q "${build_args[@]}" \
+    --build-arg "HOST_UID=$(id -u)" \
+    --build-arg "HOST_GID=$(id -g)" \
+    -t "$IMAGE" \
+    "$REPO/sandbox" >/dev/null
+
+if [[ $mode == login ]]; then
+    unset CLAUDE_CODE_OAUTH_TOKEN
+else
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" && -r "$TOKEN_FILE" ]]; then
+        perms="$(stat -c %a "$TOKEN_FILE")"
+        if [[ $perms != 600 ]]; then
+            echo "warning: $TOKEN_FILE is mode $perms; tighten it with: chmod 600 $TOKEN_FILE" >&2
+        fi
+        # shellcheck disable=SC1090
+        set -a && source "$TOKEN_FILE" && set +a
+    fi
+
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        echo "note: no token found; falling back to credentials stored in the sandbox." >&2
+        echo "note: if claude asks you to log in, see: bin/sandbox_claude --help" >&2
+    fi
+fi
+
+# Name and email only — they are public in every commit already, and this is what
+# lets the agent's commits carry your identity without mounting any git config.
+GIT_AUTHOR_NAME="$(git -C "$REPO" config --get user.name || true)"
+GIT_AUTHOR_EMAIL="$(git -C "$REPO" config --get user.email || true)"
+GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+export GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL
+
+case $mode in
+    claude) cmd=(claude --dangerously-skip-permissions "$@") ;;
+    login) cmd=(claude) ;;
+    shell) cmd=(bash) ;;
+esac
+
+read -r -a extra_docker_args <<<"${DM_SANDBOX_DOCKER_ARGS:-}"
+
+# Created host-side (so they are owned by you, i.e. by dev inside the container) rather
+# than by docker, which would make them root-owned.
+mkdir -p "$STATE/claude" "$STATE/go-mod" "$STATE/go-build"
+
+# Env vars are passed by name, never as -e NAME=value: the value would otherwise be
+# visible in the host's process list.
+exec docker run --rm -it \
+    --hostname dm-sandbox \
+    --cap-drop=ALL \
+    --security-opt no-new-privileges \
+    --pids-limit 1024 \
+    -v "$REPO:/workspace" \
+    -v "$STATE/claude:/home/dev/.claude" \
+    -v "$STATE/go-mod:/home/dev/go/pkg/mod" \
+    -v "$STATE/go-build:/home/dev/.cache/go-build" \
+    -w /workspace \
+    -e CLAUDE_CODE_OAUTH_TOKEN \
+    -e GIT_AUTHOR_NAME -e GIT_AUTHOR_EMAIL \
+    -e GIT_COMMITTER_NAME -e GIT_COMMITTER_EMAIL \
+    -e TERM -e COLORTERM \
+    "${extra_docker_args[@]}" \
+    "$IMAGE" "${cmd[@]}"
