@@ -902,23 +902,50 @@ follows up with `dm merge llm/<B>` per listed entry, then `dm commit` → `dm pu
 `dm` free of the one hands-off write the rest of the model avoids, and lets the agent skip
 a companion it recognizes as abandoned.
 
-**Detection — true-merge flows only.** Hosted providers often **rebase or squash**
-before merging, so `B`'s commits are rewritten and `B`'s tip is *not* an ancestor of
-`main` — `git branch --merged` misses it. v1 auto-detects only what is unambiguous:
-`git log --merges --first-parent` over `main` since the companion's last fold names the
-source branch in the subject (`Merge branch 'topic/x'`,
-`Merge pull request #N from …/topic/x`), and the merge commit's second parent
-corroborates by ancestry. A companion matched this way is listed **landed** (`✓`) —
-definitive, since a rejected PR never produces a merge commit on `main`. Every other
-unfolded companion is listed **undetermined** (`?`): squash/rebase merges leave no merge
-commit, and the tempting fallback — "the code branch was deleted on `origin`" — cannot
-distinguish a merged PR from one closed without merging, so v1 does not guess.
-**Accepted caveat:** on squash/rebase flows the agent must know from outside git (the
-PR, the user) that a `?` companion landed before folding it. Folding early is harmless
-for a branch that *does* eventually land — the fold is an **idempotent CRDT union**
-(§8.2), so a re-fold yields the identical result — but folding a branch that never
-lands pollutes `llm/main`, which is exactly why `?` entries are never auto-folded. The
-CI end state (§11) sidesteps detection entirely: the merge event names the source
+**Detection — ancestry + patch-id, never subject text.** Hosted providers often
+**rebase or squash** before merging, so `B`'s commits are rewritten and `B`'s tip is
+*not* an ancestor of `main` — `git branch --merged` misses it. Detection is purely
+local and **content-based**; parsing merge-commit subjects (`Merge branch 'topic/x'`,
+`Merge pull request #N from …`) was considered and rejected — subjects are free text,
+editable, and squash-message templates vary per host. Three detectors, checked over
+`main`'s first-parent history since the companion's last fold:
+
+- **true merge** — a merge commit whose second parent is, or reaches, the code branch's
+  tip: pure ancestry, definitive (a rejected PR never produces a merge commit on
+  `main`).
+- **squash merge** — the `git patch-id` of the branch's *whole range diff*
+  (`merge-base..tip` taken as one combined patch) equals the patch-id of a single
+  commit on `main`: an untouched squash commit is exactly that combined patch.
+- **rebase merge** — every commit in `merge-base..tip` is patch-id-equivalent to a
+  commit on `main` (`git cherry` reports nothing unmatched).
+
+A companion matched by any detector is listed **landed** (`✓`). Every other unfolded
+companion is **undetermined** (`?`); the tempting fallback — "the code branch was
+deleted on `origin`" — cannot distinguish a merged PR from one closed without merging,
+so v1 does not guess.
+
+**Accepted edge cases** (each degrades to `?` — except the last, the one false-`✓`
+path):
+
+- **diff modified in flight** — conflict resolutions during the merge, a hosted
+  "update branch" back-merge into the PR, or maintainer edits change the landed patch;
+  patch-ids no longer match → `?`.
+- **empty range** — a branch whose `merge-base..tip` diff is empty would match anything
+  vacuously; skipped → `?`.
+- **deleted local ref** — all three detectors need the code branch's tip to compute
+  ancestry / `merge-base..tip`; if `topic/x` was already deleted locally, the companion
+  is listed `?` (hence the lifecycle order: fold first, `dm prune` last).
+- **patch-id coincidence** — an *identical* diff landing on `main` via an unrelated
+  commit marks a never-merged branch landed. Accepted: the companion's notes then
+  describe changes that genuinely are in `main`, so the fold is as harmless as any
+  early fold of a landing branch (idempotent union, §8.2).
+
+**Accepted caveat:** where all three detectors miss, the agent must know from outside
+git (the PR, the user) that a `?` companion landed before folding it. Folding early is
+harmless for a branch that *does* eventually land — the fold is an **idempotent CRDT
+union** (§8.2), so a re-fold yields the identical result — but folding a branch that
+never lands pollutes `llm/main`, which is exactly why `?` entries are never auto-folded.
+The CI end state (§11) sidesteps detection entirely: the merge event names the source
 branch, so CI can `dm merge llm/<that>` directly regardless of rebase/squash.
 
 **Decision — `dm prune <B>`.** After `llm/<B>` is folded into `llm/main`, `dm prune <B>`
