@@ -87,100 +87,125 @@ asks whether a different stance deletes the problems instead of patching them.
 | **etckeeper / gitwatch** | Hook/watcher auto-commit | Hooks work but carry the known failure modes: not installed, bypassed, races |
 | **`reference-transaction` hook** | Fires on every ref update | If hooks at all: this one subsumes post-checkout/commit/merge/rewrite — still opt-in per clone |
 
+dm ends up needing none of these: with content + origin anchored on every note (§3),
+there is no dm-side sync state to maintain — reads compare the anchors against the
+current tree and refs directly (§5). Nothing observes git; queries just look.
+
 Named and rejected: **submodule/gitlink binding** (atomic code↔notes pinning, survives
 squashes — but every PR touches the same gitlink and conflicts with every other PR);
 **forge-native storage** (PR comments/Discussions — abandons git-native and offline).
 
 ## 3. The two ideas
 
-### Idea 1 — Reconcile, don't observe (from jj)
+### Idea 1 — Anchor notes to content + origin, not to a branch-mirrored path
 
-dm keeps a snapshot of all refs + HEAD in `.dm/ref-snapshot`. **Every invocation starts
-by diffing current refs against the snapshot** and deriving what happened since:
+Replace (branch, path) as a note's home with two facts stamped at write time:
 
-- branch advanced → new commits to resolve notes against,
-- same branch name, old tip unreachable from new tip → rebase; translate any bindings,
-- new merge commit on `main` → mirror/fold context,
-- HEAD on a different branch → the "alignment" case, handled with full context instead
-  of a refusal.
+- **content key** = blob SHA of the described bytes (`git hash-object` of the
+  working-tree file — no `@` placeholder, no stamp-at-commit; A5 disappears by
+  construction: the note is bound to the exact bytes it described),
+- **origin** = the HEAD commit at write time (branch name kept as a display hint only).
 
-Properties: idempotent catch-up (works after a week of un-dm'd git activity), zero
-installation, immune to bypassed/missing hooks. Hooks demote to optional *freshness*
-accelerators, never correctness mechanisms. **This idea is worth adopting regardless of
-Idea 2.**
+One metadata branch for the whole repo (no `llm/<B>` companions). The two anchors are
+exactly what §0's visibility rule consumes: the content key answers **(a)**, the origin
+commit answers **(b)**.
 
-### Idea 2 — Key notes by content, not by branch-mirrored path (from git-annex/Fossil)
+### Idea 2 — Visibility is a query, not maintained state (from Fossil/git-annex)
 
-Replace (branch, path) as a note's home with:
-
-- **one** metadata branch for the whole repo (no `llm/<B>` companions),
-- a file note's primary key = the **blob SHA it describes** (which §7.5's staleness
-  anchor already stores), path demoted to a display hint.
-
-Branch visibility becomes **emergent**: a note surfaces where its blob (or a descendant
-of it) exists in the checked-out working tree. A note written on `topic/x` about new
-code is invisible on `main` until the PR lands — because the blobs aren't there —
-and appears on `main` the moment the *tree* lands, regardless of merge strategy
-(true/squash/rebase all land the tree). No companions, no `dm checkout`, no fold, no
-merge detection, no orphan gate.
+Where a note applies is never stored — it is computed per read by comparing the
+anchors against the current tree and refs. A note written on `topic/x` is invisible on
+`main` because its origin hasn't landed there, and appears the moment it does,
+regardless of merge strategy. No companions, no `dm checkout`, no fold, no orphan
+gate — and no dm-side snapshot to keep in sync with git either: nothing observes git
+events. The only stored derivations are **verdict records** (§5), memoizing the one
+thing git structurally forgets — what became of rewritten origin lines.
 
 ## 4. Model sketch
 
 - **Store**: one metadata branch (or `refs/dm/*` DAGs, git-bug-style), append-only
   records, CRDT union merge — the entire §5/§7 record machinery of design.md carries
   over unchanged (CR/SU/TB/RA/FB/LN/UL, rec-id ULIDs, G-counter headers, handles).
-- **Keys**: file notes → blob SHA + path hint. Folder/arch notes → hybrid (§6 below).
+- **Anchors**: file notes → content blob + origin commit, path as display hint (§3).
+  Folder/arch notes → hybrid (§6 below).
 - **Inner loop**: unchanged — `r:` / `s:` / `a` / `u` / `d` / `k` / `f` / `al` / `dl`.
 - **Outer loop collapses to one verb**: `dm sync` = commit store → fetch → CRDT union →
   push (with non-ff retry). Replaces checkout/merge/unmerged/prune/push/fetch.
-- **Anchor at write time**: key = `git hash-object` of the working-tree file *at write
-  time*. No `@` placeholder, no stamp-at-commit — A5 disappears by construction: the
-  note is bound to the exact bytes it described.
 - **§8.4's hard gate** becomes an optional hygiene worklist ("notes not resolving in
   this tree"), never destructive: an unresolved note stops *surfacing*; nothing forces
   tombstones.
 
-## 5. Lifecycle comparison — design.md vs this spike
+## 5. Mechanics — what is persisted where
 
-Actors: **human** (developer), **agent** (LLM driving dm), **forge** (hosted button).
+Derived requirements-first from §0: persist only what the visibility rule forces, compute everything else at
+read time. A note must durably carry three facts — its text, a content fingerprint for
+rule (a), an origin commit for rule (b) — and row 14 forces a shared, conflict-free,
+append-only note set. Everything beyond that floor is either a memoized query result or
+a disposable cache.
 
-| # | Step in code repo | dm step currently in design.md | dm step under reconciliation + content-keyed store |
-|---|---|---|---|
-| 1 | `git clone` (human) | `dm init` — replica id, empty `llm/main`, worktree | `dm init` — replica id, fetch/create the single metadata branch |
-| 2 | `git checkout -b topic/x` from main tip (human/agent) | `dm checkout` — create/bind companion from `llm/main` tip (agent) | **nothing** — notes resolve against the blobs in the checked-out worktree |
-| 3 | branch from an old commit — hotfix off `v1.0` | same as #2 → shadow/code skew → orphan storm, forced `rm` (**A1**) | **nothing** — old worktree contains old blobs; era-appropriate notes surface automatically |
-| 4 | plain `git checkout other` mid-session with unsaved notes (human) | next dm call refuses on mismatch; `dm commit` ↔ `dm checkout` deadlock (**A4**) | **nothing to desync** — no alignment check; uncommitted store state is branch-independent; reconciliation notes the HEAD move |
-| 5 | editing, learning (agent) | inner loop; writes accumulate uncommitted | same verbs, same loop — note keyed to the blob it describes at write time; path = display hint |
-| 6 | `git commit` on code branch (agent/human) | nothing; `@` anchors pending until `dm commit` → whole-session drift window (**A5**) | **nothing needed** — anchor *is* the key, stamped from the exact bytes described at write time |
-| 7 | `git rebase -i` / `--amend`, incl. dropped commits | nothing fires; staleness gate catches fallout later | **nothing** — notes bind to content, not commits; dropped work's blobs leave the tree, its notes go invisible (not destroyed) |
-| 8 | wrap up, `git push`, open PR (agent) | `dm pre-commit` (hard gate) → `dm commit` → `dm push` | `dm sync`; the gate becomes an optional hygiene worklist, never destructive |
-| 9 | `git merge topic/x` into main locally | `dm merge llm/topic/x` → `dm commit` → `dm push` → `dm prune` | **nothing** — merged tree carries the blobs; notes surface on `main` immediately |
-| 10 | PR merged via hosted button — true/squash/rebase (forge) | `dm unmerged` (ancestry + patch-id detection, §8.5) → `dm merge` each → commit/push/prune | **nothing** — every merge strategy lands the tree, and the tree is all that matters |
-| 11 | `git pull` while teammates also write notes | `dm fetch` "moves the companion ref" — clobber/wedge on divergence (**A3**) | `dm sync` — fetch + CRDT union of the one store branch (git-annex-proven) + push retry |
-| 12 | teammate force-pushes the shared code branch | invisible; bindings/ancestry silently wrong | **immune** — nothing binds to code commits; reconciliation refreshes its snapshot |
-| 13 | `git branch -d topic/x` after landing (human) | `dm prune topic/x` | **nothing** — no companion exists |
-| 14 | recreate the *name* `topic/x` for unrelated work | `dm checkout` silently binds the stale old companion | **nothing** — branch names carry no note state |
-| 15 | `git bisect` / detached HEAD debugging (agent) | unspecified — alignment check has no branch | **works normally** — blobs in the detached worktree resolve; writes keyed by content as usual |
-| 16 | PR from a fork (contributor) | uncovered — companion lives on the fork, never fetched | reduced, not solved: fetch the fork's store branch and union (trivially mergeable, CI-able) — someone must still fetch |
+### Terms
 
-Rows 2–4, 6–7, 9–10, 12–14 collapse to **nothing** — precisely the set where A1, A3,
-A4, A5 and the merge-detection machinery lived.
+| term | meaning |
+|---|---|
+| **store** | the single shared metadata branch (`refs/dm/store`): append-only record files, one ULID-named file per record, CRDT union merge. Its commit tree also carries the **anchored blobs**, keeping described content fetchable forever (no reflog dependence). The only replicated persistence. |
+| **pending** | `.git/.dm/pending/` — records not yet committed to the store; clone-local; folded into a store commit by `dm sync`. Reads always see **store ∪ pending**. |
+| **cache** | `.git/.dm/cache/*` — memoized read-time query results (blob→records, similarity matches). Disposable; never load-bearing. |
+| **note record** | text · content key = blob SHA of described bytes at write time · path hint · **origin** = HEAD commit SHA at write time (branch name as display hint only). |
+| **verdict record** | memoized answer about an origin line git can no longer answer itself: **landed** (origin O landed as commit M — squash/rebase) or **abandoned** (origin unreachable from all refs, unlanded). Appended lazily by whichever clone first computes it; union-synced. |
+| **derived** | no write — computed at read time from CR + store ∪ pending. |
 
-### What the new model pays instead
+Both halves of the visibility rule are two-point git queries at read time:
+**(a) content present?** — exact blob in the current tree, else similarity-match the
+anchored blob against the tree (git rename detection between origin commit and
+checkout): match ⇒ visible (stale if edited), none ⇒ orphaned. **(b) origin landed?** —
+one ancestry check, falling back to verdict records where history rewriting broke
+ancestry. The five states of §0 are never stored — they are classifications.
 
-- **A follow algorithm** (§7): every edit creates a new blob, so surfacing notes for a
-  modified file means resolving descendants of the keyed blob. This replaces all the
-  ref choreography with one retrieval problem — the load-bearing unknown of the spike.
-- **Hybrid keying**: folder/place notes have no blob (§6); a residue stays path-keyed
-  with a (much smaller) rename story.
-- **Weaker branch privacy**: notes sync on one shared branch before code lands; a
-  teammate who has your blobs (pulled your branch) sees your notes. Isolation is
-  "no blob, no note" — usually equivalent to companion isolation, not always.
-- **No forcing function for hygiene**: design.md's hard gate guaranteed reconciliation;
-  here hygiene must come from worklists/ranking/decay — review finding **D1** (deferred
-  hygiene loop) becomes *more* important, not less.
+### Persistence table
+
+Rows mirror the requirements table in §0.
+
+| # | action in code repo (CR) | persistence dm |
+|---|---|---|
+| 1 | repo created, commits exist, dm initialized | create `.git/.dm/` (replica id, empty pending); fetch or create the empty store branch. Nothing in the working tree, nothing on code branches |
+| 2 | note added on file F while on main | append **note record** to **pending** (F's blob anchored, origin = main's HEAD) |
+| 3 | branch B from main; note added on G | same as row 2, origin = B's HEAD. Visibility split main/B: **derived** (ancestry check on origin) |
+| 4 | main progresses; note on H added on main | same as row 2. B's non-seeing of H: **derived** |
+| 5 | B rebased onto main (clean) | **nothing at rebase.** First read on B that finds origin not-ancestor-but-present computes the patch-id match and appends a **landed verdict** (old origin → new commit); every replica inherits |
+| 6 | branch C created; CR still on B | **nothing.** Mutual invisibility: **derived** |
+| 7 | note N added on B, no commit/sync yet | append to **pending** only — dirty blob anchored via the store tree. Immediate visibility falls out of reads consulting store ∪ pending |
+| 8 | B rebased with conflict resolution changing G | **nothing at rebase.** (b): landed verdict as row 5. (a): G's drift is **derived** — anchored blob vs. current tree similarity ⇒ stale flag, recomputed per read, never stored |
+| 9 | B merged into main | true merge: **derived** — origin now ancestor of main, zero writes. Squash: first read appends a **landed verdict** (patch-id/tree containment). G's stale flag persists because it keeps being derived, until `k` re-anchors the note to the current blob |
+| 10 | noted file edited in working tree, uncommitted | **derived** — working blob ≠ anchor ⇒ stale. No write at any point |
+| 11 | noted file renamed/moved | **derived** — anchored blob found at new path (similarity match if also edited ⇒ stale). No re-key record; cache may memoize the match, disposably |
+| 12 | noted file deleted on the current line | **derived** — no match anywhere in tree ⇒ orphaned, worklist is a query. Writes only when the agent acts (tombstone, re-anchor) |
+| 13 | branch B deleted without merging | first read that finds origin unreachable from every local/remote ref and unlanded appends an **abandoned verdict** — persisted so the classification survives GC and replicates |
+| 14 | teammate clones/pulls the same state | `dm sync`: fold pending → store commit → fetch → union merge (distinct ULID filenames ⇒ conflict-free) → push with non-ff retry. Teammate fetches store; identical view is **derived** — same store + same refs ⇒ same answers (asterisk: transient divergence until a needed verdict record exists) |
+| 15 | detached HEAD / bisect at old commit | **derived** — same queries against the detached tree and its ancestry. Writes (if any) persist as row 2, origin = the detached commit |
+
+Durable writes happen at exactly three moments: **note records at write time**
+(rows 2/3/4/7/15), **verdict records at first-read-after-history-rewrite**
+(rows 5/8-b/9-squash/13), **store commits at sync** (row 14). Rows 6, 10, 11, 12 are
+pure queries. There is no per-clone mutable state that could make two clones disagree
+except pending, which is by definition not yet shared.
+
+### What the model pays
+
+- **Read-time cost moves up**: similarity matching per unresolved note at read instead
+  of once at reconciliation; mitigated by the disposable cache, but Q3 (large-repo
+  performance) gets sharper.
+- **Convergence is eventual, not immediate**: two clones can transiently disagree on
+  (b) when one has fetched an origin commit the other lacks — until the first memoized
+  verdict lands in the store (the row-14 asterisk).
+- **Store growth**: anchored blobs ride in the store tree so dirty-written content
+  stays fetchable; git dedups blobs that any commit already contains, so the overhead
+  is only truly uncommitted content.
+- **No forcing function for hygiene**: worklists/ranking/decay must replace design.md's
+  hard gate — review finding **D1** (deferred hygiene loop) becomes *more* important,
+  not less.
 
 ## 6. Folder notes (no blob to key on)
+
+(§0 specifies file notes only; folder-note behavioral requirements are still open.)
 
 Options examined:
 
@@ -197,82 +222,77 @@ Options examined:
   `svc/`. Location is a query, not a stored fact (the Fossil move).
 - **Path key + rename inference — keep for member-less "place" notes** (e.g.
   "everything under `ops/` deploys to k8s" — describes a *place*, not contents).
-  A folder rename is trivially visible in a reconciliation tree diff (same blob set,
-  new prefix) and is fixed with one appended re-key record — the MV mechanism shrunk to
-  a maintenance detail.
+  A folder rename is trivially visible in a tree diff between origin and checkout
+  (same blob set, new prefix) and is fixed with one appended re-path record — the MV
+  mechanism shrunk to a maintenance detail.
 
 **Hybrid**: file notes → blob key · member-bearing arch notes → derived LCA home ·
 place notes → path key with inferred renames. Only the last category retains rename
 exposure, and it is the smallest.
 
-## 7. Resolving blob drift (edits)
+## 7. Resolving drift — read-time resolution
 
-Key realization: **git already stores the lineage** — a path's blob history *is* the
-follow chain (`git log --follow`, rename detection included). dm mostly queries it and
-patches two gaps.
+With both anchors stored, resolution is a **two-point comparison**: the note's
+write-time state (anchored blob, origin commit) against the current checkout. No
+history walk is load-bearing — git's diff machinery between origin and checkout
+supplies moves, copies, and similarity pairing on demand.
 
-### When each part happens
+### Rule (a) — is the content present?
 
-| Moment | What happens |
-|---|---|
-| **Write** (`a`/`u`) | Key = `git hash-object` of the working-tree file now. Immediate; no placeholder; A5 gone by construction |
-| **Read** (`r:path`) | Resolution (below). Pure lookup, no lineage writes |
-| **Reconciliation** (start of every dm invocation) | Diff refs/worktree since last snapshot. Patches the two gaps: (1) a note keyed to a *dirty* blob never committed as-is → re-key to the nearest committed blob at its path hint (one append record); (2) folder-rename inference for path-keyed notes. Each hop is recorded while it is one small commit range — cheap and high-confidence |
-| **Hygiene** (`k`/`u`/`d`) | Agent deliberately re-keys — today's re-anchor. `k` = confirm + re-key to current blob. The RA record and its LWW fold carry over unchanged |
-
-### Read-time resolution order
-
-1. **Exact** — current blob at path equals the key → fresh.
-2. **Ancestor** — key appears in the path's blob history (cached git log walk) or in
-   dm re-key records → note applies, surfaced `⚠stale`. "Stale" now measurably means
-   *N revisions of drift* rather than "bytes differ" — a gradable signal (keep the
-   binary flag for v1).
-3. **Moved content** — key not in this path's lineage but the blob exists/existed at
-   another path → note followed its content through a move or split; surface at the
-   new location. The case path-keying can never handle: extract-file refactors carry
-   their notes.
-4. **Unresolved** — nowhere in tree or history → hygiene worklist. A *visibility*
-   fact, never a gate demanding tombstones.
+1. **Exact** — anchored blob in the tree at the path hint → visible, fresh.
+2. **Moved** — anchored blob in the tree at another path → visible there, fresh
+   (pure rename/extract — the case path-keying can never handle: extract-file
+   refactors carry their notes).
+3. **Edited** — blob absent; similarity-match it against the checkout (§8) → visible
+   at the matched path, flagged `⚠stale`. Staleness is gradable (similarity score) —
+   keep the binary flag for v1.
+4. **Unresolved** — no match → orphaned; hygiene worklist. A *visibility* fact, never
+   a gate demanding tombstones.
 
 Ambiguity policy (dm detects, agent decides): multiple candidates → prefer the path
-hint, flag the rest, `k`/`u` settles it.
+hint, flag the rest; `k`/`u` settles it.
+
+### Rule (b) — has the origin landed?
+
+Origin ancestor of HEAD → landed here · else a **landed verdict** exists → landed ·
+else origin reachable from another local/remote ref → pending-elsewhere · else
+abandoned (verdict appended on first computation — §5).
+
+### Hygiene
+
+`k` = confirm + re-anchor to the current blob and HEAD — design.md's RA record and its
+LWW fold carry over unchanged. `u` rewrites and re-anchors; `d` tombstones.
 
 Explicitly out for v1: **hunk-level following** (blame-style line attribution) —
 max fidelity, but requires line ranges on notes, which design.md §7.5 already rejected
-as rot-prone. Whole-file blob identity + git history is the 90% solution; the only
-novel dm state is the occasional re-key record (the existing RA record with a new job).
+as rot-prone. Whole-file blob identity is the 90% solution.
 
 ## 8. Move-with-edit — git rename detection
 
 Git stores no renames; `git mv` + edit and `rm`/`add` + edit are identical in history.
 Rename-ness is inferred at diff time by content similarity (`-M`, ~50% default
-threshold). This slots in as resolution layer 3:
+threshold). This powers resolution layer 3:
 
-- A move-with-edit leaves blob `B` at `old/path` (parent) and `B' ≠ B` at `new/path`
-  (child); similarity pairs them, extending the lineage chain `B → B'` across the path
-  change. The note surfaces at `new/path` flagged `⚠stale` — correct, since it
-  described the pre-edit content; `k` re-blesses and re-keys to `B'`.
-- **Run detection eagerly at reconciliation, not lazily at read**: the since-snapshot
-  diff is one commit range, so the candidate set is tiny and pairing is
-  high-confidence. Append a re-key record per pair touching a noted file.
-- **Resolved once, ever**: re-key records union across replicas via the store branch —
-  whoever reconciles first pays; everyone inherits, including replicas that never saw
-  the intermediate commits. (Contrast design.md §8.4: every branch's agent re-homes
-  manually at the gate.) Read-time `git log --follow -M` remains the fallback for
-  moves made by someone who never runs dm, before any replica reconciled that range.
+- A move-with-edit leaves the anchored blob `B` at `old/path` in the origin tree and
+  `B' ≠ B` at `new/path` in the checkout; one similarity diff origin→checkout pairs
+  them. The note surfaces at `new/path` flagged `⚠stale` — correct, since it described
+  the pre-edit content; `k` re-blesses and re-anchors to `B'`.
 - **dm can beat stock git detection**: it only cares about noted paths, so it can
   afford a lower similarity threshold plus copy detection (`-C`) without whole-tree
-  false-positive risk, and can score candidates against the note's *anchor* blob
+  false-positive risk, and can score candidates against the note's anchored blob
   directly.
+- **Nothing persisted**: matches land in the disposable cache; re-running the diff
+  reproduces the answer on any clone, so there is no resolved-state to replicate,
+  corrupt, or migrate.
 
 **Residue handed to the agent** (worklist, never a hard gate): move + heavy rewrite
 below threshold (indistinguishable from delete-and-create — `mv` survives as a verb
 for exactly this); file splits with both sides heavily edited (copy detection catches
 at most one side; ambiguity policy applies); true deletions.
 
-Net effect: rename detection is what shrinks design.md's §8.4 from a mandatory,
-every-branch, hard-gated manual reconciliation to an automated common case with an
-agent-reviewed remainder.
+Net effect: rename detection shrinks design.md's §8.4 from a mandatory, every-branch,
+hard-gated manual reconciliation to an automated common case with an agent-reviewed
+remainder.
 
 ## 9. Open questions — what the spike must validate
 
@@ -282,15 +302,20 @@ agent-reviewed remainder.
 2. **False-pairing rate at lowered similarity thresholds.** A note silently following
    the *wrong* file is worse than one going unresolved → conservative auto-accept
    threshold + a "resolved-by-inference, unconfirmed" flag the agent can bless in bulk.
-3. **Read-path performance on large repos**: the per-noted-file history walk must be
-   amortizable (blob→entry index built at reconciliation).
+3. **Read-path performance on large repos**: per-note similarity queries at read time
+   must be amortizable (batched diffs, disposable blob→record cache) — sharpened by
+   §5 moving all resolution cost to reads.
 4. **Store transport**: single branch with union merge driver (git-annex-style) vs
    `refs/dm/*` operation DAGs (git-bug-style; causal ordering would also retire the
    wall-clock LWW caveat and review B-items touching rec-id ordering). Decide.
 5. **Derived-LCA home**: cost of computing member resolution per read; caching.
-6. **Branch privacy semantics**: is "no blob, no note" acceptable isolation, or does
-   any use case need notes hidden even from someone holding the blobs?
+6. **Store-level privacy**: §0's rule (b) settles read-path isolation, but the store
+   branch syncs before code lands — anyone who fetches it can read note *text*.
+   Acceptable, or does any use case need partitioning/encryption?
 7. **Hygiene without a hard gate**: what replaces the forcing function (D1 interacts).
+8. **Verdict correctness**: a wrong landed/abandoned verdict replicates like any
+   record; needs a correction story (LWW-overridable verdicts, `k`-style
+   re-confirmation) — interacts with Q2's false-pairing concern.
 
 ## 10. Relationship to design.md
 
@@ -300,13 +325,13 @@ testing strategy (§9). Review findings A2/B5/C1–C3 (handles, id storage, link
 locking, backreferences) apply to *both* architectures and still need resolving.
 
 **Dissolves under this spike**: most of §8 — companions and worktrees (§8.1), the fold
-choreography and merge detection (§8.2, §8.5 — including the patch-id detection adopted
-2026-07-14), commit cadence gating (§8.3), the hard orphan gate (§8.4). Staleness
-(§7.5) is *promoted*: the anchor becomes the primary key.
+choreography and merge detection (§8.2, §8.5 — patch-id matching survives only in
+shrunken form, inside landed verdicts, §5), commit cadence gating (§8.3), the hard
+orphan gate (§8.4). Staleness (§7.5) is *promoted*: the write-time anchor becomes half
+of every note's identity (content + origin).
 
 **Superseded if adopted** (fallback package if the spike fails): the `Dm-Code` binding
-trailer + recorder-hooks package on the existing companion model. Idea 1
-(reconciliation) should be adopted in either outcome.
+trailer + recorder-hooks package on the existing companion model.
 
 **Decision pending**: run the spike (validate §9, especially Q1/Q2) before investing
 further in companion-model patches, since a positive result obsoletes them.
