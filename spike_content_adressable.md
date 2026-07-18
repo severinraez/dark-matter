@@ -109,7 +109,7 @@ thing git structurally forgets — what became of rewritten origin lines.
   records, CRDT union merge — the entire §5/§7 record machinery of design.md carries
   over unchanged (CR/SU/TB/RA/FB/LN/UL, rec-id ULIDs, G-counter headers, handles).
 - **Anchors**: file notes → content blob + origin commit, path as display hint (§3).
-  Folder/arch notes → hybrid (§6 below).
+  Folder notes → path key + origin commit, resolved by the same read-time diff (§6).
 - **Inner loop**: unchanged — `r:` / `s:` / `a` / `u` / `d` / `k` / `f` / `al` / `dl`.
 - **Outer loop collapses to one verb**: `dm sync` = commit store → fetch → CRDT union →
   push (with non-ff retry). Replaces checkout/merge/unmerged/prune/push/fetch.
@@ -186,32 +186,47 @@ except pending, which is by definition not yet shared.
   hard gate — review finding **D1** (deferred hygiene loop) becomes *more* important,
   not less.
 
-## 6. Folder notes (no blob to key on)
+## 6. Folder notes — path as key
 
 (§0 specifies file notes only; folder-note behavioral requirements are still open.)
 
-Options examined:
+Folder note = text · **path key** · origin commit. A folder has no stable blob to key
+on — hashing the path is still a path key, just unreadable, and the tree SHA is
+globally volatile by construction (any edit to any file under the folder changes it).
+So the path itself is the key, and the **origin commit supplies the matching
+fingerprint** that the anchored blob supplies for files: the origin's tree at the
+noted path — its tree SHA and member set at write time.
 
-- **Hash of the folder path — rejected.** Still a path key, just unreadable; inherits
-  every rename problem (`api/` → `svc/` changes the hash exactly as much as the path).
-- **Tree SHA — rejected.** Git's real content address for a folder hashes the entire
-  subtree recursively: any edit to any file under it changes the tree SHA. A folder
-  note keyed this way detaches on virtually every commit. (Blobs anchor well because a
-  file's bytes are *locally* stable; trees are *globally* volatile by construction.)
-- **Derived home — adopt for member-bearing notes.** An architecture note already
-  carries `links[]` to blob-keyed member entries, so it needs no key of its own: its
-  home is **computed** — the LCA of wherever its members currently resolve. Rename
-  `api/` → `svc/` and the note follows, because its members' blobs now live under
-  `svc/`. Location is a query, not a stored fact (the Fossil move).
-- **Path key + rename inference — keep for member-less "place" notes** (e.g.
-  "everything under `ops/` deploys to k8s" — describes a *place*, not contents).
-  A folder rename is trivially visible in a tree diff between origin and checkout
-  (same blob set, new prefix) and is fixed with one appended re-path record — the MV
-  mechanism shrunk to a maintenance detail.
+Resolution is the same two-point comparison as §7, origin → checkout:
 
-**Hybrid**: file notes → blob key · member-bearing arch notes → derived LCA home ·
-place notes → path key with inferred renames. Only the last category retains rename
-exposure, and it is the smallest.
+1. **Exact** — the path exists in the checkout → visible, fresh. Member churn doesn't
+   matter: a folder note describes the place, not the contents.
+2. **Moved, pure** — path absent, but the origin's tree SHA at that path appears
+   elsewhere in the checkout → follow there, fresh (`git mv api/ svc/` with no member
+   edits preserves the tree SHA by construction).
+3. **Moved with churn** — no identical tree; aggregate the file-level rename detection
+   already computed for file notes (§8): where did the folder's member files go?
+   Majority prefix mapping (`api/* → svc/*`) → follow, flagged below full agreement.
+   Files pair blobs by similarity; folders aggregate those pairs and vote by prefix.
+4. **Unresolved** — members appear in the diff as deletions (no rename pairs) →
+   folder deleted → orphaned, worklist. Scattered with no majority prefix →
+   ambiguity, agent decides (same policy as multi-candidate file matches).
+
+**Rule (b) is unchanged** — origin ancestry and verdict records apply to folder notes
+verbatim; nothing folder-specific.
+
+**Nothing new persisted**: matches land in the disposable cache; `k` re-anchors the
+path key to the resolved location exactly as it re-anchors a file note to the current
+blob — same verb, same RA record, no separate re-path record type. Cost piggybacks on
+the same batched origin→checkout diff file notes already need (Q3 unaffected).
+
+Edge cases: **split** (`api/` → `api-core/` + `api-http/`) — two prefixes, no
+majority → ambiguity, agent picks (duplicating the note is out of scope for v1);
+**absorbed** (contents moved into a pre-existing `svc/`) — the vote finds `svc/` but
+it holds foreign content → follow with an unconfirmed flag; **empty folders** — git
+cannot represent them, so a folder containing no files has nothing to diff (inherent
+limit); **threshold** — the member-fraction required for auto-follow is Q2's
+conservative-auto-accept policy applied at folder level.
 
 ## 7. Resolving drift — read-time resolution
 
@@ -291,7 +306,9 @@ remainder.
 4. **Store transport**: single branch with union merge driver (git-annex-style) vs
    `refs/dm/*` operation DAGs (git-bug-style; causal ordering would also retire the
    wall-clock LWW caveat and review B-items touching rec-id ordering). Decide.
-5. **Derived-LCA home**: cost of computing member resolution per read; caching.
+5. **Folder-note follow thresholds**: what majority-prefix fraction auto-follows a
+   folder rename (Q2's false-pairing concern at folder level); split and absorbed
+   cases need agent-facing UX.
 6. **Store-level privacy**: §0's rule (b) settles read-path isolation, but the store
    branch syncs before code lands — anyone who fetches it can read note *text*.
    Acceptable, or does any use case need partitioning/encryption?
