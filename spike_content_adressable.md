@@ -7,10 +7,12 @@
 
 ---
 
-## 0. Behavioral requirements — file notes
+## 0. Behavioral requirements
 
-Mechanism-free specification of how dm must behave, agreed 2026-07-18. Folder notes
-deliberately excluded for now.
+Mechanism-free specification of how dm must behave. File notes agreed 2026-07-18;
+folder notes added the same day.
+
+### File notes
 
 **Visibility rule**: a note is visible iff **(a)** the working tree contains the content
 it describes **AND (b)** the note's origin line is part of the current checkout's
@@ -49,6 +51,39 @@ leave normal reads for the worklist. Nothing is ever silently destroyed.
 **Open point (row 15)**: strict lineage hides notes written *later on main itself* from
 old-main checkouts (main-as-of-then hadn't received them) — during bisect one might
 *want* later knowledge about unchanged files. Strict reading stands until decided.
+
+### Folder notes
+
+Same visibility rule, same shorthand. Rule (b) is identical for folder notes, so the
+lineage rows are delegated wholesale (row 3 below); the folder-specific rows are all
+about rule (a).
+
+| # | action in code repo (CR) | behaviour dm |
+| --- | --- | --- |
+| 1 | note added on folder `api/` while on main | visible whenever the checkout contains path `api/` and descends from main |
+| 2 | files under `api/` added, edited, deleted — any member churn | note stays visible and **fresh** — a folder note describes the place, not the contents; member churn alone never flags it |
+| 3 | all lineage cases: branch isolation, landing by merge/squash/rebase, abandoned branch, teammate clone, detached HEAD | identical to file-note rows 3–9 and 13–15 above with "folder note" substituted — nothing folder-specific in rule (b) |
+| 4 | `git mv api/ svc/`, no member edits | note follows to `svc/`, fresh |
+| 5 | `git mv api/ svc/` plus member edits | follows to `svc/`; fresh when the whole folder evidently moved together, flagged unconfirmed when the evidence is partial |
+| 6 | most members move to `svc/`, the rest deleted | follows to `svc/`, flagged |
+| 7 | folder renamed in the working tree, uncommitted | as rows 4–6 — visible at the new path immediately, no commit required first |
+| 8 | split: `api/` → `api-core/` + `api-http/` | **not** auto-followed: ambiguity, surfaced on the worklist, agent picks the home (duplicating the note is out of scope for v1); never silently dropped |
+| 9 | members absorbed into a pre-existing `lib/` full of foreign content | follows to `lib/`, flagged unconfirmed regardless of how strong the evidence is |
+| 10 | members scattered across several folders, none clearly the successor | ambiguity, agent decides — same policy as multi-candidate file matches |
+| 11 | folder deleted (members deleted, nothing moved) | orphaned: leaves normal reads, appears on the worklist; never destroyed |
+| 12 | note on `api/v1/`; parent renamed via `git mv api/ svc/` | note follows to `svc/v1/` — each note resolves independently; the move of the parent carries the child along |
+| 13 | folder moved to `svc/` **and** a new, unrelated `api/` created at the old path | exact path wins: note stays at `api/` on the foreign content, fresh — the deliberate cost of path-as-key; `k`/`u` re-path it |
+| 14 | folder deleted (note orphaned), much later a new `api/` created | note **resurrects** at `api/`, fresh — same consequence of path keying |
+
+**Folder states**: the five states carry over with one substitution — folder notes
+replace **stale** with **unconfirmed**: a folder note is never content-stale (row 2),
+only follow-uncertain (rows 5, 6, 9).
+
+**Rows 13/14 — accepted** (2026-07-18): exact-path-wins shadows a real move (13) and
+resurrects long-buried notes (14). Accepted as-is: the behavior is right for
+place-notes, and `k`/`u` repair the rest. An "occupant changed" flag (current
+contents share nothing with write-time contents) remains a possible later softening,
+not v1.
 
 ---
 
@@ -188,7 +223,7 @@ except pending, which is by definition not yet shared.
 
 ## 6. Folder notes — path as key
 
-(§0 specifies file notes only; folder-note behavioral requirements are still open.)
+(Behavioral requirements: §0's folder-note table.)
 
 Folder note = text · **path key** · origin commit. A folder has no stable blob to key
 on — hashing the path is still a path key, just unreadable, and the tree SHA is
@@ -337,8 +372,8 @@ remainder.
    merge driver (git-annex-style) vs `refs/dm/*` operation DAGs (git-bug-style) —
    causal ordering would also retire the wall-clock LWW caveat and the review B-items
    touching rec-id ordering. Decide.
-4. **Folder-note behavioral requirements** (§6): §0 covers file notes only; the
-   agent-facing UX for split/absorbed cases is also unspecified.
+4. **Split/absorbed UX** (§0, §6): the agent-facing flow for the folder cases dm
+   refuses to auto-follow (split) or follows unconfirmed (absorbed).
 5. **Hygiene without a hard gate** (§4, §7): design.md §8.4's gate became an optional
    worklist and stale/orphaned are mere classifications — what supplies the forcing
    function (ranking, decay, review cadence)? Review finding D1 grows more important
