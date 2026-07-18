@@ -67,33 +67,16 @@ asks whether a different stance deletes the problems instead of patching them.
 
 ## 2. Prior art
 
-### Metadata-beside-code systems
+Surveyed separately in
+[existing_git_branch_follow_strategies.md](existing_git_branch_follow_strategies.md):
+metadata-beside-code systems (git-annex, git-bug, git-appraise, Gerrit NoteDb, Fossil),
+git-observing/wrapping systems (jj, GitButler, hook-based watchers), and the named-and-
+rejected options (submodule binding, forge-native storage).
 
-| System | How it syncs | Transferable lesson |
-|---|---|---|
-| **git-annex** | One global `git-annex` branch of timestamped log lines; union merge; keyed by *content hash*, not path | The 15-year-proven version of dm's CRDT branch — and it never mirrors code branches. Metadata keyed by blob identity survives renames and branches for free |
-| **git-bug** | Each bug = append-only DAG of operation commits under `refs/bugs/*`; ordering from DAG causality + Lamport clocks | Causal ordering instead of wall-clock ULIDs kills the clock-skew caveat; fetch is union-of-DAGs, inherently non-clobbering (A3) |
-| **git-appraise** | Review data as JSON in `refs/notes/devtools/*`, merged `cat_sort_uniq` (union) | Union-merged metadata refs push/fetch fine through GitHub — design.md §8.1's "only `refs/heads` is reliable" applies to *PR-able* branches, not metadata refs |
-| **Gerrit NoteDb** | All review metadata as append-only meta commits, single-writer server | One folding authority (server/CI) makes the concurrent-merge problem disappear entirely |
-| **Fossil SCM** | Wiki/tickets/code are one global set of immutable artifacts; sync = set union; state is a computed view | The purest form of dm's idea: *which notes apply where* is a **query**, not a ref topology |
-
-### Git-observing / wrapping systems
-
-| System | How it stays in sync | Transferable lesson |
-|---|---|---|
-| **Jujutsu (jj)** | No hooks — every invocation imports git refs, **diffs them against its own last-known snapshot**, reconciles; plus an operation log of its own mutations | **State reconciliation beats event observation**: nothing to install, nothing missed, `--no-verify` can't bypass it |
-| **jj working-copy-as-commit** | The working copy is always a commit; "dirty" doesn't exist | dm's content-dirt deadlock (A4) exists only because uncommitted note state exists |
-| **GitButler** | Daemon + own `refs/gitbutler/*`, reconciles with real refs | Same pattern, daemon flavor |
-| **etckeeper / gitwatch** | Hook/watcher auto-commit | Hooks work but carry the known failure modes: not installed, bypassed, races |
-| **`reference-transaction` hook** | Fires on every ref update | If hooks at all: this one subsumes post-checkout/commit/merge/rewrite — still opt-in per clone |
-
-dm ends up needing none of these: with content + origin anchored on every note (§3),
-there is no dm-side sync state to maintain — reads compare the anchors against the
-current tree and refs directly (§5). Nothing observes git; queries just look.
-
-Named and rejected: **submodule/gitlink binding** (atomic code↔notes pinning, survives
-squashes — but every PR touches the same gitlink and conflicts with every other PR);
-**forge-native storage** (PR comments/Discussions — abandons git-native and offline).
+dm ends up needing none of the sync mechanisms surveyed there: with content + origin
+anchored on every note (§3), there is no dm-side sync state to maintain — reads compare
+the anchors against the current tree and refs directly (§5). Nothing observes git;
+queries just look.
 
 ## 3. The two ideas
 
