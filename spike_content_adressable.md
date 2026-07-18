@@ -174,7 +174,7 @@ except pending, which is by definition not yet shared.
 ### What the model pays
 
 - **Read-time cost moves up**: similarity matching per unresolved note at read instead
-  of once at reconciliation; mitigated by the disposable cache, but Q3 (large-repo
+  of once at reconciliation; mitigated by the disposable cache, but Q2 (large-repo
   performance) gets sharper.
 - **Convergence is eventual, not immediate**: two clones can transiently disagree on
   (b) when one has fetched an origin commit the other lacks — until the first memoized
@@ -212,21 +212,31 @@ Resolution is the same two-point comparison as §7, origin → checkout:
    folder deleted → orphaned, worklist. Scattered with no majority prefix →
    ambiguity, agent decides (same policy as multi-candidate file matches).
 
+**Follow heuristic**: the rank-3 vote auto-follows only
+when three checks pass — a **majority of paired members** agrees on one target
+prefix; the winner beats the runner-up prefix by a clear **margin** (6/10 to `svc/`
+with the other 4 deleted is a rename; 6/10 to `api-core/` with 4 in `api-http/` is a
+split); and the pairs **cover** a minimum fraction of the original member set (a
+2-member folder with one pair and one deletion is 100% of pairs but 50% coverage —
+too thin to auto-follow). Unanimous with full coverage → fresh; passing below that →
+flagged; no winner → ambiguity. Exact fractions ride the same Q1 calibration harness
+as the file-level bands (§8).
+
 **Rule (b) is unchanged** — origin ancestry and verdict records apply to folder notes
 verbatim; nothing folder-specific.
 
 **Nothing new persisted**: matches land in the disposable cache; `k` re-anchors the
 path key to the resolved location exactly as it re-anchors a file note to the current
 blob — same verb, same RA record, no separate re-path record type. Cost piggybacks on
-the same batched origin→checkout diff file notes already need (Q3 unaffected).
+the same batched origin→checkout diff file notes already need (Q2 unaffected).
 
 Edge cases: **split** (`api/` → `api-core/` + `api-http/`) — two prefixes, no
-majority → ambiguity, agent picks (duplicating the note is out of scope for v1);
-**absorbed** (contents moved into a pre-existing `svc/`) — the vote finds `svc/` but
-it holds foreign content → follow with an unconfirmed flag; **empty folders** — git
-cannot represent them, so a folder containing no files has nothing to diff (inherent
-limit); **threshold** — the member-fraction required for auto-follow is Q2's
-conservative-auto-accept policy applied at folder level.
+majority margin → ambiguity, agent picks (duplicating the note is out of scope for
+v1); **absorbed** (contents moved into a pre-existing `lib/` that is mostly foreign
+content) — the vote may be unanimous, but the target may no longer be what the note
+described → follow with an unconfirmed flag regardless of vote strength; **empty
+folders** — git cannot represent them, so a folder containing no files has nothing
+to diff (inherent limit).
 
 ## 7. Resolving drift — read-time resolution
 
@@ -256,6 +266,17 @@ Origin ancestor of HEAD → landed here · else a **landed verdict** exists → 
 else origin reachable from another local/remote ref → pending-elsewhere · else
 abandoned (verdict appended on first computation — §5).
 
+**Verdict correction**: wrong verdicts are repaired at the note level
+in v1, with verbs that already exist. Wrong *abandoned* (notes wrongly worklisted —
+e.g. the origin lived on a remote dm couldn't see): `k` from the worklist on the
+right checkout — re-anchoring to current blob + HEAD gives the note a fresh origin
+that resolves by plain ancestry, no verdict consulted. Wrong *landed* (notes wrongly
+surfacing on a line their origin never reached): `k` would bless them there —
+instead `d` here and re-add on the correct branch. Accepted v1 caveats: a verdict is
+per-*origin*, so repair is O(notes sharing that origin), and the stale verdict
+lingers in the store. LWW-overridable verdict records stay a later optimization for
+the many-notes-per-origin case, not a v1 requirement.
+
 ### Hygiene
 
 `k` = confirm + re-anchor to the current blob and HEAD — design.md's RA record and its
@@ -279,6 +300,15 @@ threshold). This powers resolution layer 3:
   afford a lower similarity threshold plus copy detection (`-C`) without whole-tree
   false-positive risk, and can score candidates against the note's anchored blob
   directly.
+- **Acceptance is banded, with a uniqueness margin**: ≥ ~80% similarity
+  to the anchored blob *and* the best candidate beating the runner-up by ≥ ~20 points
+  → auto-accept (`⚠stale`); ~50–80%, or a high score with a close runner-up → follow
+  flagged "resolved-by-inference, unconfirmed" for bulk blessing; below ~50% →
+  unresolved. The margin is the load-bearing part: false pairings come from clusters
+  of near-identical candidates (boilerplate, generated code, fixtures), not from a
+  lone wrong file scoring high in isolation. Thin margins tie-break on path-hint
+  affinity (same basename, directory distance). The band numbers are starting
+  guesses — Q1's replay harness doubles as the calibration rig.
 - **Nothing persisted**: matches land in the disposable cache; re-running the diff
   reproduces the answer on any clone, so there is no resolved-state to replicate,
   corrupt, or migrate.
@@ -294,28 +324,25 @@ remainder.
 
 ## 9. Open questions — what the spike must validate
 
-1. **Does resolution follow ordinary edit churn?** If everyday editing routinely lands
-   notes in "unresolved", the model fails regardless of the merge story. Metric:
-   fraction of notes resolving via layers 1–3 across a real repo's history replay.
-2. **False-pairing rate at lowered similarity thresholds.** A note silently following
-   the *wrong* file is worse than one going unresolved → conservative auto-accept
-   threshold + a "resolved-by-inference, unconfirmed" flag the agent can bless in bulk.
-3. **Read-path performance on large repos**: per-note similarity queries at read time
-   must be amortizable (batched diffs, disposable blob→record cache) — sharpened by
-   §5 moving all resolution cost to reads.
-4. **Store transport**: single branch with union merge driver (git-annex-style) vs
-   `refs/dm/*` operation DAGs (git-bug-style; causal ordering would also retire the
-   wall-clock LWW caveat and review B-items touching rec-id ordering). Decide.
-5. **Folder-note follow thresholds**: what majority-prefix fraction auto-follows a
-   folder rename (Q2's false-pairing concern at folder level); split and absorbed
-   cases need agent-facing UX.
-6. **Store-level privacy**: §0's rule (b) settles read-path isolation, but the store
-   branch syncs before code lands — anyone who fetches it can read note *text*.
-   Acceptable, or does any use case need partitioning/encryption?
-7. **Hygiene without a hard gate**: what replaces the forcing function (D1 interacts).
-8. **Verdict correctness**: a wrong landed/abandoned verdict replicates like any
-   record; needs a correction story (LWW-overridable verdicts, `k`-style
-   re-confirmation) — interacts with Q2's false-pairing concern.
+1. **Does resolution follow ordinary edit churn?** If everyday editing routinely drops
+   notes to layer 4 (unresolved) of §7's rule (a), the model fails regardless of the
+   merge story. Metric: fraction of notes resolving via layers 1–3
+   (exact/moved/edited, §7–§8) across a real repo's history replay — which doubles
+   as the calibration rig for the acceptance-band fractions (§6, §8).
+2. **Read-path performance on large repos** (§5 "what the model pays"): all resolution
+   cost now sits on reads; per-note similarity queries must amortize through the one
+   batched origin→checkout diff that file (§8) and folder (§6) resolution share, plus
+   the disposable cache (§5 terms).
+3. **Store transport** (§4, §5 terms): single `refs/dm/store` branch with a union
+   merge driver (git-annex-style) vs `refs/dm/*` operation DAGs (git-bug-style) —
+   causal ordering would also retire the wall-clock LWW caveat and the review B-items
+   touching rec-id ordering. Decide.
+4. **Folder-note behavioral requirements** (§6): §0 covers file notes only; the
+   agent-facing UX for split/absorbed cases is also unspecified.
+5. **Hygiene without a hard gate** (§4, §7): design.md §8.4's gate became an optional
+   worklist and stale/orphaned are mere classifications — what supplies the forcing
+   function (ranking, decay, review cadence)? Review finding D1 grows more important
+   under this model (§5 "what the model pays").
 
 ## 10. Relationship to design.md
 
@@ -333,5 +360,6 @@ of every note's identity (content + origin).
 **Superseded if adopted** (fallback package if the spike fails): the `Dm-Code` binding
 trailer + recorder-hooks package on the existing companion model.
 
-**Decision pending**: run the spike (validate §9, especially Q1/Q2) before investing
-further in companion-model patches, since a positive result obsoletes them.
+**Decision pending**: run the spike (validate §9, especially Q1 — which also
+calibrates the §6/§8 acceptance bands) before investing further in companion-model
+patches, since a positive result obsoletes them.
