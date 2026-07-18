@@ -7,6 +7,51 @@
 
 ---
 
+## 0. Behavioral requirements — file notes
+
+Mechanism-free specification of how dm must behave, agreed 2026-07-18. Folder notes
+deliberately excluded for now.
+
+**Visibility rule**: a note is visible iff **(a)** the working tree contains the content
+it describes **AND (b)** the note's origin line is part of the current checkout's
+lineage — written on this line, or on a line that has since merged into it. (b) is a
+deliberate isolation choice: a file-specific note may only make sense in the changed
+context of its branch, so content presence alone is not sufficient. "On branch B" below
+is shorthand for "the checked-out tree has B's content"; branch *names* carry no
+visibility semantics.
+
+| # | action in code repo (CR) | behaviour dm |
+|---|---|---|
+| 1 | repo created, commits exist, then dm initialized | dm ready; no notes; full history usable from here on |
+| 2 | note added on file F while on main | note visible whenever the tree contains F as described and the checkout descends from main — right now that means main |
+| 3 | branch B from main; note added on file G | on B: G-note **and** F-note visible (B contains main's content and descends from it); on main: F-note only — B-origin notes stay invisible there until B lands, even for files B didn't change |
+| 4 | main progresses; note added on file H on main | on main: F+H; on B: F+G — H's content isn't in B's tree (and had B already contained identical content, main's later note would still surface on B only once B rebases onto/merges in that main state) |
+| 5 | B rebased onto main (clean) | on B: F+G+H all visible; main unchanged |
+| 6 | branch C created; CR still on B | notes written on C are invisible on B, and vice versa — unmerged lines never see each other's notes |
+| 7 | note N added on B; CR on B | visible immediately on B, no commit/sync step required first |
+| 8 | B rebased onto main, conflict resolution changes G | G's note is **flagged, not hidden**: still surfaced, marked "content has drifted — needs re-confirmation"; all other notes unaffected |
+| 9 | B merged into main (any strategy — merge, squash, rebase) | on main: B's notes appear (origin line has now landed), including G's note *still carrying its flag* until someone re-confirms it |
+| 10 | noted file edited in working tree, uncommitted | note still visible, flagged stale (same state as row 8) |
+| 11 | noted file renamed/moved (with or without edits) | note follows to the new path; flagged stale only if content also changed |
+| 12 | noted file deleted on the current line | note orphaned: leaves normal reads, appears on a review worklist; never silently destroyed |
+| 13 | branch B deleted *without* merging | B-only notes stop being visible anywhere; they appear on the worklist as "abandoned," distinguishable from "pending on an unmerged branch" |
+| 14 | teammate clones/pulls the same state | sees exactly the same notes with the same flags — visibility is a pure function of tree state + lineage, not of who wrote what where |
+| 15 | detached HEAD / bisect at an old commit | notes whose content is present *and* whose origin line had landed as of that commit are visible; later notes are not — same rule, no special-casing |
+
+**Note states**: every note is in exactly one of five states per checkout —
+**visible** · **stale** (visible, flagged: content drifted, needs re-confirmation) ·
+**pending-elsewhere** (content and origin exist, but the origin line hasn't landed
+here) · **abandoned** (origin line deleted without landing) · **orphaned** (described
+content no longer exists anywhere dm can place it). Stale and orphaned are distinct by
+design: drift dm can locate is flagged and stays usable; only notes dm cannot place
+leave normal reads for the worklist. Nothing is ever silently destroyed.
+
+**Open point (row 15)**: strict lineage hides notes written *later on main itself* from
+old-main checkouts (main-as-of-then hadn't received them) — during bisect one might
+*want* later knowledge about unchanged files. Strict reading stands until decided.
+
+---
+
 ## 1. Why this spike
 
 The critical review findings against design.md's git mechanics — A1 (orphan-gate data

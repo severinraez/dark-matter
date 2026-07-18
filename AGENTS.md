@@ -1,0 +1,1 @@
+If I have a prompt.txt, ignore it - it's where I write the prompt before pasting it into chat.
