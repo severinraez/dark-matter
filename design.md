@@ -1,9 +1,11 @@
 # Dark Matter — Design
 
-> **Status:** design settled. Every decision below is made; there are no open **TBD**s.
-> Items intentionally punted to a later version are collected in §11 (Deferred). This
-> document is the source of truth for the model, the CLI, the storage format, and the git
-> mechanics.
+> **Status:** architecture settled 2026-07-19 — the **content-addressable model**
+> (notes anchored to content + origin, one shared store, visibility computed per read)
+> is adopted, superseding the companion-branch model (rejected; §13). The behavioral
+> requirements (§2) and the mechanics (§3–§12) are normative. What still needs
+> validating or deciding is collected in §14 (Open Questions); intentionally punted
+> scope is §15 (Deferred).
 
 ---
 
@@ -11,97 +13,182 @@
 
 ### 1.1 What it is
 Dark Matter (`dm`) is a git-native memory layer for LLM agents: notes *about* a
-codebase that live beside the code, branch and merge *with* the code, and are queried
-through a token-efficient batch CLI with progressive disclosure.
+codebase that live beside the code, surface exactly where and when they apply — right
+branch, right commit, any merge strategy — and are queried through a token-efficient
+batch CLI with progressive disclosure.
 
 The knowledge is not source and does not belong in the code files. It is the "dark
 matter" around the code — architecture rationale, gotchas, dev/ops know-how — that an
-agent accumulates and wants back later, on the right branch, without re-deriving it.
+agent accumulates and wants back later, in the right context, without re-deriving it.
 
 ### 1.2 Design goals
 - **Token-efficiency** — the CLI is batch-oriented and reads never dump; they return a
   *map* of what is queryable, with a size on every hidden thing, so the agent spends
   tokens deliberately.
-- **Deterministic merge** — the LLM companion of a branch merges without human
-  conflicts, always, by construction (union / CRDT semantics, not textual patch).
+- **Conflict-free sharing** — all notes live in a single append-only store merged by
+  CRDT union; no human (or agent) ever resolves a merge conflict, by construction.
+  Where a note applies is never stored — it is computed per read from the note's
+  anchors and the current checkout (§2, §9) — so branch topology, rebases, and
+  squashes need no bookkeeping and cannot corrupt anything.
 - **Progressive discovery** — an agent starts shallow and drills into exactly the
   dimensions it needs (long bodies, links, parent notes) over successive batches.
 
 ### 1.3 Glossary
-- **Shadow tree** — the note-bearing directory tree that mirrors the code tree.
-- **Companion branch** — for a code branch `B`, the shadow branch `llm/<B>` (§8.1).
-- **Node** — a single addressable location in the shadow tree: a file or a folder.
+- **Store** — the single shared metadata branch (`refs/dm/store`) holding every note
+  record; the only replicated persistence (§8.1).
+- **Anchor** — the write-time facts binding a note to code. File notes: **content
+  key** (blob SHA of the described bytes) + **origin**; folder notes: **path key** +
+  origin (§3.1).
+- **Origin** — the HEAD commit at write time; the lineage half of the visibility rule
+  (§2).
+- **Node** — an addressable location notes resolve to: a file or folder of the
+  current checkout.
 - **Logical entry** — one note. Has a stable id, a subject, a body, links, and a
   revision history. Addressed by a **handle**.
 - **Handle** — a short, stable, identity-derived reference to a logical entry
-  (`#a3f9c1`), reusable across batches and across merges.
-- **Replica** — a single clone/agent, identified by a local id, for CRDT counters.
+  (`#a3f9c1`), reusable across batches and across syncs (§3.5).
+- **Verdict record** — memoized answer about a rewritten origin line: **landed** or
+  **abandoned** (§9.4).
+- **Pending** — clone-local records not yet folded into the store; reads always see
+  store ∪ pending (§8.2).
+- **Replica** — a single clone/agent, identified by a local id, for CRDT counters
+  (§8.5).
 - **Subject** — the kind of knowledge a note carries: code / architecture /
-  development / operations.
+  development / operations (§3.3).
 - **LWW register** — a single-valued field merged **last-write-wins**: when two
-  branches set it concurrently, the merge keeps the value with the higher position in a
-  **total order** (so every replica picks the same winner) and discards the other. Two
-  order sources are used: the header `t` register merges by **max timestamp** (equal
-  timestamps carry the same value, so no tiebreak is needed), while body-log resolution
-  (current body, anchor, move destination) orders by the winning record's `<rec-id>`
-  ULID (§7.3). Everything else in the header is a set/counter that unions.
+  replicas set it concurrently, the merge keeps the value with the higher position in
+  a **total order** (so every replica picks the same winner) and discards the other.
+  Two order sources are used: the `t` stat register merges by **max timestamp** (equal
+  timestamps carry the same value, so no tiebreak is needed), while record-log
+  resolution (current body, anchor) orders by the winning record's `<rec-id>` ULID
+  (§8.3). Everything else in the stats is a set/counter that unions.
 
 ---
 
-## 2. Data Model
+## 2. Behavioral Requirements
 
-### 2.1 Shadow tree & the `B` / `llm/<B>` companion branch
-For every code branch `B` there is a companion branch `llm/<B>` whose tree mirrors `B`'s
-directory structure but contains only notes — no source. A code file `foo/bar.rb` maps
-to a note file at the same path `foo/bar.rb` in the shadow tree. (Storage scheme: §8.1.)
+Mechanism-free specification of how dm must behave (file notes agreed 2026-07-18;
+folder notes the same day). These tables are **normative**: the storage (§8) and
+resolution (§9) machinery exists to satisfy them, and the test scenarios (§11) replay
+them row by row.
 
-Git lifecycle is mirrored:
+### 2.1 File notes
 
-| Code op                     | Shadow op                          |
-|-----------------------------|------------------------------------|
-| branch `B'` from `B`        | branch `llm/<B'>` from `llm/<B>`   |
-| merge `B` into `main`       | merge `llm/<B>` into `llm/main`    |
-| new branch, no companion    | `llm/<B>` starts empty             |
+**Visibility rule**: a note is visible iff **(a)** the working tree contains the
+content it describes **AND (b)** the note's origin line is part of the current
+checkout's lineage — written on this line, or on a line that has since merged into it.
+(b) is a deliberate isolation choice: a file-specific note may only make sense in the
+changed context of its branch, so content presence alone is not sufficient. "On branch
+B" below is shorthand for "the checked-out tree has B's content"; branch *names* carry
+no visibility semantics.
 
-Merging `-llm` branches never produces a human conflict (see §8.2). This is the
-founding invariant and constrains every storage decision below.
+| # | action in code repo (CR) | behaviour dm |
+|---|---|---|
+| 1 | repo created, commits exist, then dm initialized | dm ready; no notes; full history usable from here on |
+| 2 | note added on file F while on main | note visible whenever the tree contains F as described and the checkout descends from main — right now that means main |
+| 3 | branch B from main; note added on file G | on B: G-note **and** F-note visible (B contains main's content and descends from it); on main: F-note only — B-origin notes stay invisible there until B lands, even for files B didn't change |
+| 4 | main progresses; note added on file H on main | on main: F+H; on B: F+G — H's content isn't in B's tree (and had B already contained identical content, main's later note would still surface on B only once B rebases onto/merges in that main state) |
+| 5 | B rebased onto main (clean) | on B: F+G+H all visible; main unchanged |
+| 6 | branch C created; CR still on B | notes written on C are invisible on B, and vice versa — unmerged lines never see each other's notes |
+| 7 | note N added on B; CR on B | visible immediately on B, no commit/sync step required first |
+| 8 | B rebased onto main, conflict resolution changes G | G's note is **flagged, not hidden**: still surfaced, marked "content has drifted — needs re-confirmation"; all other notes unaffected |
+| 9 | B merged into main (any strategy — merge, squash, rebase) | on main: B's notes appear (origin line has now landed), including G's note *still carrying its flag* until someone re-confirms it |
+| 10 | noted file edited in working tree, uncommitted | note still visible, flagged stale (same state as row 8) |
+| 11 | noted file renamed/moved (with or without edits) | note follows to the new path; flagged stale only if content also changed |
+| 12 | noted file deleted on the current line | note orphaned: leaves normal reads, appears on a review worklist; never silently destroyed |
+| 13 | branch B deleted *without* merging | B-only notes stop being visible anywhere; they appear on the worklist as "abandoned," distinguishable from "pending on an unmerged branch" |
+| 14 | teammate clones/pulls the same state | sees exactly the same notes with the same flags — visibility is a pure function of tree state + lineage, not of who wrote what where |
+| 15 | detached HEAD / bisect at an old commit | notes whose content is present *and* whose origin line had landed as of that commit are visible; later notes are not — same rule, no special-casing |
 
-Mirroring is **explicit**: the agent/user drives the shadow side through `dm`
-subcommands (e.g. `dm merge <source>`) alongside the corresponding git op on the code
-branch. See §8.1.
+**Note states**: every note is in exactly one of five states per checkout —
+**visible** · **stale** (visible, flagged: content drifted, needs re-confirmation) ·
+**pending-elsewhere** (content and origin exist, but the origin line hasn't landed
+here) · **abandoned** (origin line deleted without landing) · **orphaned** (described
+content no longer exists anywhere dm can place it). Stale and orphaned are distinct by
+design: drift dm can locate is flagged and stays usable; only notes dm cannot place
+leave normal reads for the worklist. Nothing is ever silently destroyed.
 
-### 2.2 Note targets — where a note is anchored
-Every note has exactly **one home node**, which preserves the mirror property and the
-deterministic merge:
-- **file note** — homed at the file's mirror path; applies to that file.
-- **folder note** — homed at the folder's mirror path; applies to the folder **and
+Row 15's strict-lineage reading (notes written *later on main itself* stay hidden from
+old-main checkouts during bisect) stands until decided — open question **Q5** (§14).
+
+### 2.2 Folder notes
+
+Same visibility rule, same shorthand. Rule (b) is identical for folder notes, so the
+lineage rows are delegated wholesale (row 3 below); the folder-specific rows are all
+about rule (a).
+
+| # | action in code repo (CR) | behaviour dm |
+| --- | --- | --- |
+| 1 | note added on folder `api/` while on main | visible whenever the checkout contains path `api/` and descends from main |
+| 2 | files under `api/` added, edited, deleted — any member churn | note stays visible and **fresh** — a folder note describes the place, not the contents; member churn alone never flags it |
+| 3 | all lineage cases: branch isolation, landing by merge/squash/rebase, abandoned branch, teammate clone, detached HEAD | identical to file-note rows 3–9 and 13–15 above with "folder note" substituted — nothing folder-specific in rule (b) |
+| 4 | `git mv api/ svc/`, no member edits | note follows to `svc/`, fresh |
+| 5 | `git mv api/ svc/` plus member edits | follows to `svc/`; fresh when the whole folder evidently moved together, flagged unconfirmed when the evidence is partial |
+| 6 | most members move to `svc/`, the rest deleted | follows to `svc/`, flagged |
+| 7 | folder renamed in the working tree, uncommitted | as rows 4–6 — visible at the new path immediately, no commit required first |
+| 8 | split: `api/` → `api-core/` + `api-http/` | **not** auto-followed: ambiguity, surfaced on the worklist, agent picks the home (duplicating the note is out of scope for v1); never silently dropped |
+| 9 | members absorbed into a pre-existing `lib/` full of foreign content | follows to `lib/`, flagged unconfirmed regardless of how strong the evidence is |
+| 10 | members scattered across several folders, none clearly the successor | ambiguity, agent decides — same policy as multi-candidate file matches |
+| 11 | folder deleted (members deleted, nothing moved) | orphaned: leaves normal reads, appears on the worklist; never destroyed |
+| 12 | note on `api/v1/`; parent renamed via `git mv api/ svc/` | note follows to `svc/v1/` — each note resolves independently; the move of the parent carries the child along |
+| 13 | folder moved to `svc/` **and** a new, unrelated `api/` created at the old path | exact path wins: note stays at `api/` on the foreign content, fresh — the deliberate cost of path-as-key; `k`/`u` re-path it |
+| 14 | folder deleted (note orphaned), much later a new `api/` created | note **resurrects** at `api/`, fresh — same consequence of path keying |
+
+**Folder states**: the five states carry over with one substitution — folder notes
+replace **stale** with **unconfirmed**: a folder note is never content-stale (row 2),
+only follow-uncertain (rows 5, 6, 9).
+
+**Rows 13/14 — accepted** (2026-07-18): exact-path-wins shadows a real move (13) and
+resurrects long-buried notes (14). Accepted as-is: the behavior is right for
+place-notes, and `k`/`u` repair the rest. An "occupant changed" flag (current contents
+share nothing with write-time contents) remains a possible later softening, not v1
+(§15).
+
+---
+
+## 3. Data Model
+
+### 3.1 Anchors — content + origin, one store
+A note's home is not a location in a mirrored tree; it is **two facts stamped at write
+time**:
+
+- **content key** = blob SHA of the described bytes (`git hash-object` of the
+  working-tree file — the note binds to the exact bytes it described; no placeholder,
+  no later stamping pass, §8.3),
+- **origin** = the HEAD commit at write time (branch name kept as a display hint
+  only).
+
+Folder notes have no stable blob to key on, so their anchor is a **path key** +
+origin; the origin commit supplies the matching fingerprint that the anchored blob
+supplies for files — the origin's tree SHA and member set at the noted path (§9.3).
+
+There is **one metadata store for the whole repo** (§8.1) — no per-branch companions.
+The two anchors are exactly what §2's visibility rule consumes: the content key
+answers **(a)**, the origin commit answers **(b)**. Where a note applies is **never
+stored** — it is computed per read by comparing the anchors against the current tree
+and refs (§9). Nothing observes git events; queries just look.
+
+### 3.2 Note targets — where a note is anchored
+Every note has exactly **one home** — one anchor:
+- **file note** — anchored to the file's content; applies to that file wherever its
+  content resolves (§9.1).
+- **folder note** — anchored to the folder's path; applies to the folder **and
   everything under it, recursively**. This is the "parent notes" disclosure dimension:
   reading a file walks up its ancestors and surfaces folder notes along the way.
 
-One home per note is non-negotiable — union of per-node entry sets is what keeps merge
-deterministic.
+One home per note is non-negotiable — each note resolves independently through one
+anchor, which is what keeps read-time resolution and the union-merged store simple.
 
-> **Decision — folder-note storage.** A folder is a git *tree* in the shadow branch and
-> cannot also be a blob, so a folder's own notes live in a **well-known file inside it**:
-> notes homed at `api/` are stored at `api/.dm`, repo-root notes at `/.dm`. (Distinct
-> from the per-clone `.dm/` home, which lives inside the git dir and is never tracked,
-> §8.1.) The name is reserved: a code file literally named `.dm` cannot carry notes —
-> `dm` errors — an accepted limitation. The reserved file also gives the blob-vs-tree
-> merge case a deterministic rule: when one branch's shadow has a *file* note at `p` and
-> the other has a *tree* (the code turned file `p` into directory `p/`), the file's log
-> folds into `p/.dm`; entries keep their ids, and the next `dm pre-commit` surfaces them
-> for the agent to re-home properly.
-
-### 2.3 Note subjects — what kind of knowledge
+### 3.3 Note subjects — what kind of knowledge
 Subject is a **facet tagged on each entry**, not a second location; a node can carry
 entries of several subjects at once.
 
-| subj | meaning                                                | typical target |
-|------|--------------------------------------------------------|----------------|
-| `c`  | **code** — behavior, edge cases, gotchas               | file           |
-| `a`  | **architecture** — cross-cutting design, many nodes    | folder / root  |
-| `d`  | **development** — build, test, codegen, flaky tests    | file or folder |
-| `o`  | **operations** — deploy target, logging, secrets       | folder         |
+| subj | meaning                                                       | typical target |
+|------|---------------------------------------------------------------|----------------|
+| `c`  | **code** — behavior, edge cases, gotchas                      | file           |
+| `a`  | **architecture** — cross-cutting design, many nodes           | folder / root  |
+| `d`  | **development** — build, test, codegen, flaky tests           | file or folder |
+| `o`  | **operations** — deploy target, logging, where secrets live (never values) | folder |
 
 The two axes (target × subject) are independent; every combination is meaningful.
 
@@ -109,53 +196,55 @@ The two axes (target × subject) are independent; every combination is meaningfu
 > note commits to one of the defined subjects; a forced choice keeps ranking and
 > disclosure meaningful and avoids a catch-all bucket that erodes the taxonomy.
 
-### 2.4 Architecture notes (Option 1)
+### 3.4 Architecture notes
 Architecture knowledge is cross-cutting — "referred to by multiple files/folders" —
 which fights the one-home rule. Resolution: **architecture is a subject-tagged note
 (`a`) homed at the lowest common ancestor folder of the things it describes, carrying
 `links[]` to the specific member nodes.** Members surface it via back-links.
 
 Consequences:
-- Everything stays a note on a real tree node → mirror + merge unchanged.
+- Everything stays a note with a single anchor → resolution + merge unchanged.
 - Reuses existing machinery: recursive folder notes + links + parent-note disclosure
   compose to produce architecture notes for free.
 - Truly global concepts living at the repo root is *correct*, not a bug.
 
 This keeps the system to **one storage primitive** — a subject-tagged, linkable entry
-homed on one tree node — rather than a separate "concept" object.
+with one anchor — rather than a separate "concept" object.
 
-### 2.5 Logical entries, revisions & handles
+### 3.5 Logical entries, revisions & handles
 Each note is a **logical entry** with a globally-unique internal id. Its display
 **handle** is a fixed-length prefix of that id, shown as `#a3f9c1`. Because it is
 identity-derived (not positional):
 - it is the **same everywhere** the entry appears (home node *and* back-links),
-- it **survives merges** (union never changes an entry's id),
+- it **survives syncs** (union never changes an entry's id),
 - the agent can copy the exact string it saw into a later `u`/`d`/`f`.
 
-**Handle collisions:** fixed length (6 chars), **extended on the rare collision at write
-time** — dm grabs a couple more chars when minting if the handle already exists in the
-merged store. The agent therefore always sees a stable, reusable handle. The one case
-write-time extension cannot see — two replicas concurrently minting the same handle for
-different entries, discovered only at merge — is handled at resolve time: a handle that
-matches several entries errors with the extended candidates
-(`✗ #a3f9c1 ambiguous: #a3f9c1k2 · #a3f9c1p9`), and surfaces display the extended forms.
+**Handle collisions:** fixed length (6 chars), **extended on the rare collision at
+write time** — dm grabs a couple more chars when minting if the handle already exists
+in store ∪ pending. The agent therefore always sees a stable, reusable handle. The one
+case write-time extension cannot see — two replicas concurrently minting the same
+handle for different entries, discovered only at sync — is handled at resolve time: a
+handle that matches several entries errors with the extended candidates
+(`✗ #a3f9c1 ambiguous: #a3f9c1k2 · #a3f9c1p9`), and surfaces display the extended
+forms. (Handle minting under monotonic ULIDs, and what the stored id field actually
+holds, are open — **Q9**/**Q10**, §14.)
 
 > **Decision:** internal ids are **ULIDs** — globally unique without coordination,
 > lexicographically sortable by creation time (a natural tiebreak), and independent of
 > content so a supersede keeps the entry's id. A ULID is 48 bits of millisecond
 > timestamp + 80 bits of randomness (26 base32 chars: 10 time + 16 random). The handle
-> is therefore **not** a prefix of the ULID — the leading chars are wall-clock, so every
-> id minted in the same ~4-minute window would share them — but the first 6 chars of the
-> **80-bit random tail** (30 bits of entropy), extended on the rare write-time collision
-> as above. Using the whole ULID as the handle was considered and rejected: handles are
-> the densest element of every surface line, and 26 chars vs 6 is a ~4× token tax on
-> exactly the output the design optimizes.
+> is therefore **not** a prefix of the ULID — the leading chars are wall-clock, so
+> every id minted in the same ~4-minute window would share them — but the first 6
+> chars of the **80-bit random tail** (30 bits of entropy), extended on the rare
+> write-time collision as above. Using the whole ULID as the handle was considered and
+> rejected: handles are the densest element of every surface line, and 26 chars vs 6
+> is a ~4× token tax on exactly the output the design optimizes.
 
 ---
 
-## 3. CLI Interface
+## 4. CLI Interface
 
-### 3.1 Batch-over-stdin & two-phase execution
+### 4.1 Batch-over-stdin & two-phase execution
 `dm` reads commands from stdin, one per line, `cmd:...` form, to amortize token cost:
 
 ```
@@ -178,36 +267,36 @@ Execution is **two-phase**:
 > agent re-sends everything. Answering the valid reads while rejecting the malformed
 > line was considered and kept out: it would make a batch's effects depend on which
 > lines happened to parse, and "all or nothing at the syntax layer" is a simpler
-> contract for the agent than a partially-answered batch. Semantic failures are already
-> per-command (phase 2), so the tax is paid only on genuine syntax errors — rare, and
-> worth the occasional re-send.
+> contract for the agent than a partially-answered batch. Semantic failures are
+> already per-command (phase 2), so the tax is paid only on genuine syntax errors —
+> rare, and worth the occasional re-send.
 >
 > **Decision:** the body is always the **last field** of a command, so once the first
 > line is parsed we know exactly where the body starts — everything from there to the
-> end of the command is body. Consequences: `:` inside a body needs **no escaping** (all
-> preceding separators are consumed positionally before the body begins), and the body
-> may span multiple physical lines. The **only** escaped character is the line separator
-> that divides commands: a body newline is written as a trailing `\` continuation, so a
-> command runs until the first line **not** ending in `\`.
+> end of the command is body. Consequences: `:` inside a body needs **no escaping**
+> (all preceding separators are consumed positionally before the body begins), and
+> the body may span multiple physical lines. The **only** escaped character is the
+> line separator that divides commands: a body newline is written as a trailing `\`
+> continuation, so a command runs until the first line **not** ending in `\`.
 
-### 3.2 Command grammar
+### 4.2 Command grammar
 
 | cmd | form                    | action                                   |
 |-----|-------------------------|------------------------------------------|
 | `r` | `r:path` \| `r:#handle` | read node surface, or expand one entry   |
-| `r` | `r:path:N`              | read with disclosure depth N (§4.4)      |
+| `r` | `r:path:N`              | read with disclosure depth N (§5.4)      |
 | `s` | `s:path:t1\|t2`         | search node context for terms (OR)       |
 | `a` | `a:path:subj:body`      | create entry (`subj` ∈ c/a/d/o)          |
 | `u` | `u:#handle:body`        | supersede an entry's body                |
 | `d` | `d:#handle`             | tombstone an entry                       |
 | `f` | `f:#handle:sig[:reason]`| feedback (`sig` ∈ `+` `-` `!`)           |
-| `k` | `k:#handle`             | confirm stale note still valid; re-anchor|
-| `mv`| `mv:old:new`            | relocate notes; folders: recursive (§7.3)|
+| `k` | `k:#handle`             | confirm note still valid; re-anchor      |
+| `mv`| `mv:old:new`            | relocate notes manually (§6.5); folders: recursive |
 | `rm`| `rm:path`               | tombstone all entries at path (recursive)|
 | `al`| `al:#a:#b[:note]`       | add link between two entries, opt comment|
 | `dl`| `dl:#a:#b`              | delete a link between two entries        |
 
-### 3.3 Output format
+### 4.3 Output format
 One block per command, in input order. Blocks are delimited by **printable sentinel
 glyphs at line start**, and content is emitted **raw** (no indentation) to save
 characters:
@@ -217,12 +306,12 @@ characters:
 - **end-marker** `◾` (U+25FE) prefixes the terminal footer.
 
 > **Decision — printable glyphs, not control bytes.** ASCII RS/GS (`0x1E`/`0x1D`) were
-> considered — near-zero token cost, impossible in text — and rejected: agents read `dm`
-> through terminals, shell captures, and API layers that routinely strip or mangle C0
-> control bytes, which would corrupt the framing in exactly the channel the tool
-> targets. The glyphs survive every such channel, are debuggable by eye, and cost ~1
-> token each. Unambiguity is enforced at the write end instead: `dm` **rejects `▸` and
-> `◾` in note bodies** (`✗` error) — they are pure decoration characters with no
+> considered — near-zero token cost, impossible in text — and rejected: agents read
+> `dm` through terminals, shell captures, and API layers that routinely strip or
+> mangle C0 control bytes, which would corrupt the framing in exactly the channel the
+> tool targets. The glyphs survive every such channel, are debuggable by eye, and cost
+> ~1 token each. Unambiguity is enforced at the write end instead: `dm` **rejects `▸`
+> and `◾` in note bodies** (`✗` error) — they are pure decoration characters with no
 > plausible use in a note — so a body line can never be mistaken for a boundary. (C0
 > control bytes are rejected in bodies too, keeping output shell-safe.)
 
@@ -249,49 +338,62 @@ rest is raw content; `◾` closes the stream.
 Write acks are one line: `+ #handle created`, `✓ #handle superseded (rev N)`,
 `✓ #handle tombstoned`, `✓ #handle feedback +`, or `✗ #handle <error>`.
 
-> **Decision:** use the Unicode structure glyphs (`→` link, `↑` parent, `←` linked-from,
-> `★` arch, `⚠` stale) — visually unambiguous and collision-proof against content. **Match
-> markers are dropped entirely**: search snippets carry no in-content highlighting, so no
-> glyph ever needs escaping inside a body. The agent already has the term it searched for.
+> **Decision:** use the Unicode structure glyphs (`→` link, `↑` parent, `←`
+> linked-from, `★` arch, `⚠` stale) — visually unambiguous and collision-proof against
+> content. **Match markers are dropped entirely**: search snippets carry no in-content
+> highlighting, so no glyph ever needs escaping inside a body. The agent already has
+> the term it searched for.
 
-### 3.4 Error reporting
+### 4.4 Error reporting
 
-- **Batch-level** syntax failure → a single `!` line at the head of
-  output, nothing applied: `!parse error line 3: expected subject (c|a|d|o) after path`.
-- **Per-command** failure in an otherwise-valid batch → that command's block contains a
-  `✗ …` line; other commands still apply.
+- **Batch-level** syntax failure → a single `!` line at the head of output, nothing
+  applied: `!parse error line 3: expected subject (c|a|d|o) after path`.
+- **Per-command** failure in an otherwise-valid batch → that command's block contains
+  a `✗ …` line; other commands still apply.
 - A final `◾N ok[, M error]` footer tallies the batch and signals end-of-stream.
 
 ---
 
-## 4. Retrieval & Progressive Discovery
+## 5. Retrieval & Progressive Discovery
 
-Guiding idea: **a read never dumps; it returns a map of what is queryable, with a size
-on every hidden thing.** Discovery is the agent walking that map over successive batches.
-v1 is **strictly lazy** (surface + explicit expansion); budget-fill is deferred (§11).
+Guiding idea: **a read never dumps; it returns a map of what is queryable, with a
+size on every hidden thing.** Discovery is the agent walking that map over successive
+batches. v1 is **strictly lazy** (surface + explicit expansion); budget-fill is
+deferred (§15).
 
-### 4.1 The surface (`r:path`)
-A budgeted digest of the node plus pointers to every adjacent dimension, each collapsed:
+### 5.1 The surface (`r:path`)
+A budgeted digest of the node plus pointers to every adjacent dimension, each
+collapsed:
 - own entries → one-line previews (`subj #handle first-line (+N lines) ⚠flag`),
 - parents/links → **not expanded**, shown as handles + labels + counts; arch parents
   are called out because they orient the agent,
 - an **inventory footer** — the "how much more is there" signal in one line:
   `context: 2 own · 3 parent · 2 links · ~18 hidden`.
 
-### 4.2 Cost hints
+### 5.2 Cost hints
 Every collapsed item carries its size: `(+12 lines)`, `linked from 3 nodes`,
 `2 parent notes`. The agent sees the *shape* of hidden information and decides what is
 worth a token.
 
-### 4.3 Drilling by handle
+### 5.3 Drilling by handle
 `r` accepts a **path or a handle**, so expansion is always the same move:
 - `r:path` → the surface digest for a node,
 - `r:#handle` → the **full** body of one entry + its links one level + relations.
 
-See a collapsed line → `r:#handle`. Whether it is a truncated note, a parent arch note,
-or a concept, it is one verb.
+See a collapsed line → `r:#handle`. Whether it is a truncated note, a parent arch
+note, or a concept, it is one verb.
 
-### 4.4 Depth modifier
+> **Decision — handles respect visibility (2026-07-19).** Every handle-addressed
+> command resolves against the current checkout's **visible set** (visible, stale,
+> unconfirmed — §2). A **pending-elsewhere** entry is indistinguishable from a
+> nonexistent one: `r:#handle` errors `✗ #a3f9c1 unknown`, `s` never matches it, and
+> `al`/`dl` refuse it — its notes appear the moment the origin lands, as if newly
+> created. The worklist states (**abandoned**, **orphaned**) likewise never surface
+> in reads, search, or link expansion, but they *are* addressable by the repair verbs
+> `k`/`u`/`d` (and `mv`/`rm`) from the worklist (§9.6) — that is how an orphan is
+> re-homed or retired without ever being silently destroyed.
+
+### 5.4 Depth modifier
 For orientation in fewer round-trips, a depth suffix trades tokens for round-trips,
 capped by a token budget so it degrades gracefully:
 
@@ -304,13 +406,13 @@ capped by a token budget so it degrades gracefully:
 Folder reads navigate down: `r:folder/` returns the folder's own notes + a **child
 inventory** (which subpaths carry notes, counts by subject), not the child notes.
 
-### 4.5 Context search (`s`)
+### 5.5 Context search (`s`)
 `s:path:t1|t2` searches the file's **entire read-context** (its own notes + all parent
 folder notes + linked concepts), returning matches as handles + snippets. This is the
-escape hatch when a file sits under many arch notes: grep the assembled context instead
-of expanding every parent. Terms combine with `|` = **OR** and `+` = **AND**; `+` binds
-tighter, so `a+b|c` reads as `(a AND b) OR c` — an entry matches if any OR-group has all
-its `+`-joined terms present.
+escape hatch when a file sits under many arch notes: grep the assembled context
+instead of expanding every parent. Terms combine with `|` = **OR** and `+` = **AND**;
+`+` binds tighter, so `a+b|c` reads as `(a AND b) OR c` — an entry matches if any
+OR-group has all its `+`-joined terms present.
 
 ```
 ▸s:db/schema.rb:tenant|isolation
@@ -320,61 +422,84 @@ its `+`-joined terms present.
 ```
 
 > **Decision:** `AND` (`+`) is in for v1, as above. **Whole-store search** (`s::term`
-> across the entire tree, ignoring context scope) is **dropped** — `s` is always
-> context-scoped; a global grep is out of scope, not merely deferred.
+> across everything, ignoring context scope) was dropped under the companion model;
+> the single global store makes it cheap to express, so it is **reopened as Q14**
+> (§14) rather than settled here. For v1, `s` is context-scoped.
 
-### 4.6 Ranking
+### 5.6 Ranking
 When more fits than the budget allows, order by **proximity** (closer ancestors first)
-→ **subject priority** (arch first for orientation). That is the whole v1 ranking — two
-keys, fully deterministic, no tuning.
+→ **subject priority** (arch first for orientation). That is the whole v1 ranking —
+two keys, fully deterministic, no tuning.
 
-> **Decision:** v1 ranks on **proximity then subject priority only**. Staleness, recency,
-> and the usage-stat signals (expansion rate, usefulness ratio) are *collected* (§6) but
-> kept **out of the ranking** until there's data to weight them against — a scoring
-> function with weights is deferred (§11) rather than guessed now. Stale entries are
-> still *flagged* on read (§7.5); they just don't reorder for it in v1.
+> **Decision:** v1 ranks on **proximity then subject priority only**. Staleness,
+> recency, and the usage-stat signals (expansion rate, usefulness ratio) are
+> *collected* (§7) but kept **out of the ranking** until there's data to weight them
+> against — a scoring function with weights is deferred (§15) rather than guessed
+> now. Stale entries are still *flagged* on read (§9.5); they just don't reorder for
+> it in v1.
 
 ---
 
-## 5. CRUD & the Append-Only Log
+## 6. CRUD & the Append-Only Log
 
-### 5.1 create / supersede / tombstone / keep
-To keep merge = deterministic union, `u`/`d`/`k` never mutate in place. They append log
-records against the logical entry; current state is a fold of that entry's log:
-- `a` → append a **create** (`CR`) record — mints a new id/handle,
-- `u:#handle:body` → append a **supersede** (`SU`) record — same handle, new revision,
+### 6.1 create / supersede / tombstone / keep
+To keep the store a deterministic union, `u`/`d`/`k` never mutate in place. They
+append records against the logical entry; current state is a fold of that entry's
+records:
+- `a` → append a **create** (`CR`) record — mints a new id/handle, stamps the anchors
+  (content key / path key + origin, §8.3),
+- `u:#handle:body` → append a **supersede** (`SU`) record — same handle, new
+  revision, re-stamps the anchors,
 - `d:#handle` → append a **tombstone** (`TB`) record — handle resolves to deleted,
-- `k:#handle` → append a **re-anchor** (`RA`) record — re-stamps the staleness anchor
-  (placeholder `@`, resolved at `dm commit`, §7.3), **no new body revision** (§7.5), so
-  churn stats stay clean.
+- `k:#handle` → append a **re-anchor** (`RA`) record — re-stamps the anchors (current
+  blob / resolved path + current HEAD), **no new body revision** (§9.5), so churn
+  stats stay clean.
 
-### 5.2 Handle stability
+### 6.2 Handle stability
 The handle addresses the **logical entry**, not a revision or a position, so it is
-stable through supersedes, tombstones, and merges. `#a3f9c1` always means the same note.
+stable through supersedes, tombstones, moves, and syncs. `#a3f9c1` always means the
+same note.
 
-### 5.3 Cleanup via CRUD
-There is **no dedicated dedup / duplicate signal**. If the agent finds redundant notes,
-it collapses them with plain CRUD (`u` to fold content into one, `d` to tombstone the
-other).
+### 6.3 Cleanup via CRUD
+There is **no dedicated dedup / duplicate signal**. If the agent finds redundant
+notes, it collapses them with plain CRUD (`u` to fold content into one, `d` to
+tombstone the other).
 
-### 5.4 Links
-Links follow the same append-only discipline and are the **only** way to relate entries:
-- `al:#a:#b[:note]` → append a **link** (`LN`) record — directed `#a → #b`, optional comment,
+### 6.4 Links
+Links follow the same append-only discipline and are the **only** way to relate
+entries:
+- `al:#a:#b[:note]` → append a **link** (`LN`) record — directed `#a → #b`, optional
+  comment,
 - `dl:#a:#b` → append an **unlink** (`UL`) record — the pair's current state is LWW.
-Links are never edited inside a body (§7.3); back-links are the inverse index (§7.3),
-so a link surfaces identically at both endpoints and survives supersede/move/merge.
+Links are never edited inside a body; back-links are the inverse index, computed on
+read (index story: **Q11**, §14) — so a link surfaces identically at both endpoints
+and survives supersede/move/sync.
+
+### 6.5 Manual moves (`mv`) and node removal (`rm`)
+Read-time resolution follows most moves automatically (§9.1–§9.3). `mv:old:new` is
+the **manual override** for the residue resolution can't infer — move + heavy rewrite
+below the similarity threshold, splits, ambiguous folder scatters — and the way to
+act on worklisted orphans. Folders are recursive. `rm:path` tombstones every entry
+homed at a path (recursive for folders): the node-level counterpart to `d:#handle`,
+for paths whose knowledge is genuinely gone. Both remain ordinary batch commands. The
+record form `mv` appends (per-entry re-anchor vs. a path-scoped record) is open —
+**Q7** (§14).
 
 ---
 
-## 6. Usage Statistics & Feedback
+## 7. Usage Statistics & Feedback
 
-**Decision:** stats are **merged**, not local telemetry, and are stored as a **header on
-each note file** (§7.1) — except explicit feedback, which rides the body log as `FB`
-records (§6.3). This means reads mutate the header; the cost is accepted in exchange for
-stats that rank *and* travel with branches. Stat-only churn is **second-class dirt**: it
-never blocks a git-facing verb and is auto-committed rather than gated (§8.3).
+**Decision:** stats are **merged**, not local telemetry: counters are CRDTs, so they
+union like everything else and travel with the store. Reads therefore mutate state;
+the cost is accepted in exchange for stats that can rank *and* are shared. Stat
+deltas accumulate in pending and ride the next `dm sync` (§8.4) — a read-only session
+creates no obligation and loses nothing by not syncing. Explicit feedback rides the
+record log as `FB` records (§7.3). The stats' **physical home in the store is open**
+(**Q6**, §14): the per-record file layout has no mutable header region, so the
+companion-era "stat header per note file" needs a replacement (e.g. per-entry,
+per-replica stat files, which union trivially).
 
-### 6.1 What's tracked (per logical entry)
+### 7.1 What's tracked (per logical entry)
 | stat                 | signal                                                  |
 |----------------------|---------------------------------------------------------|
 | **impressions** (`i`)| times shown *collapsed* in a surface (weak)             |
@@ -382,609 +507,533 @@ never blocks a git-facing verb and is auto-committed rather than gated (§8.3).
 | **last-expanded**(`t`)| recency of genuine use                                 |
 | **search-hits** (`h`)| surfaced as a match by `s` (distinct from impressions)  |
 | **revisions / churn**| volatile vs settled knowledge                           |
-| **feedback** (`+ - !`)| explicit agent signal (§6.3)                           |
+| **feedback** (`+ - !`)| explicit agent signal (§7.3)                           |
 
-The impression-vs-expansion split is core: surfacing is cheap, *opening* is the click.
-Two more distinctions: **expansions** (`x`) is a *count* (how often opened) while
-**last-expanded** (`t`) is a *timestamp* (how recently) — frequency vs recency, both
-needed for ranking. And **revisions / churn** is **derived from the body log**, not a
-stored counter: it is the count of `SU` records on the entry (`CR` = rev 1, each `SU`
-+1). `RA` and `TB` are *not* revisions — only `SU` — so re-anchoring via `k` never
-inflates churn, and because it folds from the unioned log it can't double-count on merge.
+The impression-vs-expansion split is core: surfacing is cheap, *opening* is the
+click. Two more distinctions: **expansions** (`x`) is a *count* (how often opened)
+while **last-expanded** (`t`) is a *timestamp* (how recently) — frequency vs recency,
+both needed for ranking. And **revisions / churn** is **derived from the record log**,
+not a stored counter: it is the count of `SU` records on the entry (`CR` = rev 1,
+each `SU` +1). `RA` and `TB` are *not* revisions — only `SU` — so re-anchoring via
+`k` never inflates churn, and because it folds from the unioned log it can't
+double-count on sync.
 
 > **Decision:** `search-hits` is a **distinct counter**, bumped when `s` surfaces an
-> entry as a match — *not* folded into impressions, and with **no attempt to correlate a
-> search with a later expansion**. That correlation would span two separate `dm`
-> invocations (search now, `r:#handle` later) with nothing tying them together, so it's
-> not tracked. A search match and a digest impression are simply different events.
+> entry as a match — *not* folded into impressions, and with **no attempt to
+> correlate a search with a later expansion**. That correlation would span two
+> separate `dm` invocations (search now, `r:#handle` later) with nothing tying them
+> together, so it's not tracked. A search match and a digest impression are simply
+> different events.
 
-### 6.2 In-file stat header
-See §7.1–7.2. One header row per logical entry; each counter cell is a per-replica
-**G-Counter**; `t` is a last-write-wins timestamp. All fields merge deterministically.
+### 7.2 Merge semantics
+- One stat row per logical entry, keyed by id.
+- Each counter (`i`, `x`, `h`) is a **G-Counter**: `A3:12,F2:4` = replica A3→12,
+  F2→4, total 16. Missing field = zero. Merge = union replicas, **max per replica**,
+  sum for value.
+- `t` is a last-write-wins timestamp register: merge = **max** timestamp.
+- Feedback tallies are **not** counters — they fold from `FB` records (§7.3), which
+  is what lets a dispute be cleared (a G-Counter could only ever grow).
 
-### 6.3 Feedback interface (`f`)
+These semantics are settled regardless of where the rows physically live (**Q6**).
+
+### 7.3 Feedback interface (`f`)
 ```
 f:#handle:<signal>[:reason]
 ```
 | signal | meaning              | effect                                        |
 |--------|----------------------|-----------------------------------------------|
-| `+`    | useful               | boosts ranking                                |
-| `-`    | not useful here      | demotes ranking                               |
+| `+`    | useful               | recorded; feeds weighted ranking when it lands (§15) |
+| `-`    | not useful here      | recorded; feeds weighted ranking when it lands (§15) |
 | `!`    | wrong / outdated     | flips surface flag to `⚠disputed`, queues for housekeeping |
 
 Optional `reason` is a short string stored with the feedback — invaluable for a later
-editor (`f:#f22e90:!:repo/ layer was removed in v3`). Feedback is a **body-log record**
-(`FB`, §7.3), not a header counter: it carries the reason, unions like every other
-record, and is content dirt (persisted by `dm commit`, §8.3). The per-entry `+`/`-`/`!`
-tallies are *derived* by folding `FB` records, like churn. `⚠disputed` is defined as an
-`FB !` record **newer (rec-id order) than the entry's latest `SU`/`RA`** — so a dispute
-is cleared exactly by the housekeeping resolutions, `u` (rewrite) or `k` (re-bless),
-each of which outranks the old complaint; a still-standing complaint re-flags by being
-re-filed. Implicit signals still count (expansion = weak +, ignore = weak −); `f` is the
-explicit, high-weight channel.
+editor (`f:#f22e90:!:repo/ layer was removed in v3`). Feedback is a **log record**
+(`FB`, §8.3), not a counter: it carries the reason, unions like every other record,
+and rides pending → sync like content. The per-entry `+`/`-`/`!` tallies are
+*derived* by folding `FB` records, like churn. `⚠disputed` is defined as an `FB !`
+record **newer (rec-id order) than the entry's latest `SU`/`RA`** — so a dispute is
+cleared exactly by the housekeeping resolutions, `u` (rewrite) or `k` (re-bless),
+each of which outranks the old complaint; a still-standing complaint re-flags by
+being re-filed. Implicit signals still count (expansion = weak +, ignore = weak −);
+`f` is the explicit, high-weight channel.
 
-### 6.4 How stats feed retrieval & surface flags
-- **Ranking** gains usefulness ratio + expansion rate on top of §4.6.
-- **Surface flags** stay token-disciplined: only *behavior-changing* signals are shown —
-  `⚠disputed` (from `!`) and `⚠stale` (hash drift, §7.5). Positive signal is expressed
-  silently through ordering, not badges.
-- **Housekeeping** (data supports it now; the agent-facing/CLI report is deferred, §11):
-  never-expanded notes past an age, disputed notes, high-churn notes, hash-drifted notes
-  → a prune/review worklist.
+### 7.4 How stats feed retrieval & surface flags
+- **Ranking** gains usefulness ratio + expansion rate once the weighted scoring
+  function lands (§15); v1 collects but does not rank on them (§5.6).
+- **Surface flags** stay token-disciplined: only *behavior-changing* signals are
+  shown — `⚠disputed` (from `!`), `⚠stale` (content drift, §9.5), and `⚠unconfirmed`
+  (uncertain follow, §9.3). Positive signal is expressed silently through ordering,
+  not badges.
+- **Housekeeping** (data supports it now; the agent-facing report is the worklist,
+  §9.6): never-expanded notes past an age, disputed notes, high-churn notes, drifted
+  notes → a prune/review worklist.
 
 ---
 
-## 7. Storage Format
+## 8. Storage & Sync
 
-### 7.1 Note file layout
-Each node's note file has two deterministically-mergeable regions split by a marker: a
-**header** (mutable CRDT stats) above a **body** (append-only entry log).
+Requirements-first (§2): persist only what the visibility rule forces, compute
+everything else at read time. A note must durably carry three facts — its text, a
+content fingerprint for rule (a), an origin commit for rule (b) — and row 14 forces a
+shared, conflict-free, append-only note set. Everything beyond that floor is either a
+memoized query result (verdicts, §9.4) or a disposable cache.
 
-```
-∎dm1
-a3f9c1 i=A3:12,F2:4 x=A3:3 t=2026-07-07T09:12Z
-b1c0e7 i=A3:5 t=2026-07-01T11:03Z
-∎
-CR 01J8Z…rec… a3f9c1 c 1a2b…sha… Schema uses single-table inheritance for tenants; the \
-discriminator column is `type`.
-SU 01J9A…rec… a3f9c1 c 9f01…sha… …now partitioned per tenant
-CR 01J8Z…rec… b1c0e7 d 77c3…sha… Regenerate with `rake db:schema` after edits
-FB 01J9B…rec… b1c0e7 + saved a broken schema regen
-```
+### 8.1 The store — one metadata branch
 
-Content edits only append to the **body**; stat updates only touch the **header**. So
-the knowledge stays diff-quiet — churn is confined to the header lines.
+> **Decision (2026-07-19):** one shared metadata branch, **`refs/dm/store`**, chosen
+> over git-bug-style per-note operation DAGs: one ref beats thousands (simpler sync,
+> compaction, and forge story), at the price of keeping the wall-clock caveat on
+> ULID-ordered LWW folds — mitigable later via Lamport counters in the record headers
+> without changing transport (§15).
 
-> **Decision — separators & multi-line.** Fields are separated by a **single space**
-> (never cosmetic alignment padding — that would churn the header as values grow). Every
-> record's fixed fields come first and are space-free (id, single-char subject, hex SHA,
-> …), so the parser splits on the leading spaces and takes the **rest of the record as
-> the body** — the same "body is the trailing field" rule as stdin (§3.1). Therefore
-> `:`, spaces, and backticks inside a body need **no escaping**. Multi-line bodies use
-> the same trailing-`\` continuation as stdin: a record spans physical lines until the
-> first line not ending in `\`; the only escape is a literal trailing backslash, doubled
-> `\\`. The header uses the same single-space rule between the id and its `key=value`
-> cells.
->
-> The fixed-field set of a body record is settled in §7.3: `<type> <rec-id> …`, where
-> `<rec-id>` is a per-record ULID that supplies union identity, the LWW timestamp, and
-> the tiebreak in one field — so there is no separate timestamp or replica column.
+- **Append-only records**, one ULID-named file per record, merged by **CRDT union**:
+  distinct filenames never collide, identical records dedup — a sync can never
+  conflict. (Exact file grouping and the stats' home ride **Q6**, §14; the union
+  semantics are settled.)
+- The store's commit tree also carries the **anchored blobs**, keeping described
+  content fetchable forever (no reflog dependence). Git dedups blobs that any commit
+  already contains, so the overhead is only truly uncommitted content that was
+  described mid-session.
+- `dm init` configures the `refs/dm/*` fetch refspec. Custom refs push/fetch fine
+  through GitHub/GitLab (git-appraise / git-annex precedent); a plain
+  `refs/heads/dm-store` branch is the fallback if a forge misbehaves (forks copy only
+  heads and tags).
 
-### 7.2 Header schema
-- One row per logical entry, keyed by id.
-- Columns: `i` impressions, `x` expansions, `h` search-hits (§6.1), `t` last-expanded.
-  Feedback tallies are **not** header columns — they fold from `FB` body records (§6.3),
-  which is what lets a dispute be cleared (a G-Counter could only ever grow).
-- Each counter cell is a **G-Counter**: `A3:12,F2:4` = replica A3→12, F2→4, total 16.
-  Missing field = zero.
-- `t` is a last-write-wins timestamp register.
+### 8.2 Clone-local state — `.git/.dm/`
+- `.git/.dm/replica` — the per-clone replica id + config (§8.5).
+- `.git/.dm/pending/` — records not yet committed to the store; folded into a store
+  commit by `dm sync`. Reads always see **store ∪ pending** — which is why a fresh
+  note is visible immediately (§2.1 row 7) with no commit or sync step.
+- `.git/.dm/cache/` — memoized read-time resolution results (blob→records, similarity
+  matches). Disposable; never load-bearing: re-running the diff reproduces every
+  answer on any clone, so there is no resolved-state to replicate, corrupt, or
+  migrate.
 
-### 7.3 Body schema
-Append log of records. Every record's first two fields are its **type** and its
-**record-id** (a per-record ULID, see below); the rest are type-specific, body last:
-- `CR <rec-id> <entry-id> <subj> <blob-sha> <body>` — create,
-- `SU <rec-id> <entry-id> <subj> <blob-sha> <body>` — supersede,
-- `TB <rec-id> <entry-id>` — tombstone,
-- `RA <rec-id> <entry-id> <blob-sha>` — re-anchor: re-stamp the staleness anchor only (§7.5),
-- `MV <rec-id> <from-path> <to-path>` — relocate: entries at `<from-path>` belong at
-  `<to-path>` (§8.4). Path-scoped, not entry-scoped; applied as a sweep during the
-  merge fold, not a per-entry edit.
-- `LN <rec-id> <from-#> <to-#> [comment]` — link, with optional comment,
-- `UL <rec-id> <from-#> <to-#>` — unlink,
+Living inside the git dir means git never walks into it from any working tree, it is
+invisible to `git status` with no exclude entry, and it is per-clone, shared across
+all code worktrees. There is no checkout binding and nothing to keep aligned — `dm`
+serves whatever HEAD and working tree it finds. (Locking between concurrent `dm`
+processes in one clone: **Q13**, §14.)
+
+### 8.3 Record schema
+Every record's first two fields are its **type** and its **record-id**; the rest are
+type-specific, body last:
+- `CR <rec-id> <entry-id> <subj> <anchor> <origin> <path> <body>` — create.
+  `<anchor>` is the content key (file note) or path key (folder note); `<origin>` the
+  HEAD commit at write time; `<path>` the display/path hint (for folder notes it
+  equals the anchor).
+- `SU <rec-id> <entry-id> <subj> <anchor> <origin> <path> <body>` — supersede;
+  re-stamps the anchors.
+- `TB <rec-id> <entry-id>` — tombstone.
+- `RA <rec-id> <entry-id> <anchor> <origin> <path>` — re-anchor only (§9.5), no body.
+- `LN <rec-id> <from-#> <to-#> [comment]` — link, with optional comment.
+- `UL <rec-id> <from-#> <to-#>` — unlink.
 - `FB <rec-id> <entry-id> <sig> [reason]` — feedback: `sig` ∈ `+`/`-`/`!`, optional
-  free-text reason (body-last rule as usual, §6.3).
-Links are their own append-only records — never a field edited inside a body — so they
-merge by union like everything else. The `al`/`dl` commands are the **only** way to
-manage links and the sole writers of `LN`/`UL` records; a link's current state folds
-from those records (LWW on the pair key, §8.2). Back-links (`← linked-from`) are the
-inverse index, computed on read.
+  free-text reason (body-last rule as usual, §7.3).
+
+There is **no `MV` record type**: the companion model's redirect-map machinery is
+gone — moves are *derived* at read time (§9.1–§9.3), and the manual `mv` verb's
+record form is open (**Q7**, §14).
+
+> **Decision — serialization.** Fields are separated by a **single space** (never
+> cosmetic alignment padding). Every record's fixed fields come first; the parser
+> splits on the leading spaces and takes the **rest of the record as the body** — the
+> same "body is the trailing field" rule as stdin (§4.1). Therefore `:`, spaces, and
+> backticks inside a body need **no escaping**. Multi-line bodies use the same
+> trailing-`\` continuation as stdin; the only escape is a literal trailing
+> backslash, doubled `\\`. **Caveat:** path-valued fixed fields (`<path>`, folder
+> anchors) can contain spaces and need an encoding that survives the space-split —
+> settled together with the physical layout under **Q6** (and review nit E3).
 
 **Decision — record identity & ordering.** `<rec-id>` is a **ULID minted per record**
 (distinct from `<entry-id>`, the logical entry's ULID). One field does three jobs:
-- **union merge** — the ULID is globally unique, so merging two logs is a set-union
-  keyed by `<rec-id>`; identical records dedup, distinct ones all survive.
-- **LWW timestamp** — a ULID embeds its 48-bit creation time, so the record *is* its own
-  write-time; no separate timestamp field. Superseding an entry, re-anchoring, or moving
-  resolves to the record with the **largest `<rec-id>`** for that entry/path.
-- **deterministic tiebreak** — two records minted in the same millisecond order by the
-  ULID's random tail. Every replica compares the same stored ULIDs and picks the same
-  winner regardless of merge order, so no explicit replica-id is needed in the body log
-  (replica-id lives only in the header G-Counters, §7.4).
+- **union merge** — the ULID is globally unique, so merging two record sets is a
+  set-union keyed by `<rec-id>`; identical records dedup, distinct ones all survive.
+- **LWW timestamp** — a ULID embeds its 48-bit creation time, so the record *is* its
+  own write-time; no separate timestamp field. Superseding an entry or re-anchoring
+  resolves to the record with the **largest `<rec-id>`** for that entry.
+- **deterministic tiebreak** — two records minted in the same millisecond order by
+  the ULID's random tail. Every replica compares the same stored ULIDs and picks the
+  same winner regardless of merge order, so no explicit replica-id is needed in the
+  records (replica-id lives only in the stat G-Counters, §8.5).
 
-So the body log carries **no timestamp or replica column** — both are subsumed by
-`<rec-id>`. Two refinements make the order trustworthy:
+Two refinements make the order trustworthy:
 
 - **Monotonic minting.** `dm` mints ULIDs in the spec's *monotonic mode* per process:
   within the same millisecond, each successive id increments the previous random tail
-  instead of re-rolling it. This guarantees a batch's records order as written — an `a`
-  followed by a `u` of the same entry in one batch can never fold backwards. Cost:
-  essentially none; same-ms ids lose independence of their random bits, which only
-  matters to the handle scheme, and handles are collision-checked at mint time anyway
-  (§2.5).
+  instead of re-rolling it. This guarantees a batch's records order as written — an
+  `a` followed by a `u` of the same entry in one batch can never fold backwards.
+  (Interaction with handle entropy: **Q9**; same-batch backreference: **Q12**, §14.)
 - **Clock skew — accepted.** rec-id order is wall-clock order, so a clone with a fast
-  clock wins concurrent LWW resolutions until its skew is corrected. Accepted for v1 and
-  on the record here: resolution stays deterministic and nothing is destroyed — losers
-  remain in the log as sibling revisions — and NTP-sane clocks make the window
-  irrelevant in practice.
+  clock wins concurrent LWW resolutions until its skew is corrected. Accepted for v1
+  and on the record here: resolution stays deterministic and nothing is destroyed —
+  losers remain in the log as sibling revisions — and NTP-sane clocks make the window
+  irrelevant in practice. (Lamport counters can retire the caveat later, §15.)
 
-Tests pin the clock (ULID time bits) and the seeded id source (random tail),
-so every LWW outcome is reproducible (§9.2).
+Tests pin the clock (ULID time bits) and the seeded id source (random tail), so every
+LWW outcome is reproducible (§11).
 
-**Decision — staleness anchor.** The `<blob-sha>` on `CR`/`SU`/`RA` is the git blob SHA
-of the described file — git's own content address, so no separate hashing pass. It is
-**not** stamped at write time: mid-session the code file is typically dirty, and
-`HEAD:path` would anchor a fresh note to a pre-edit blob, flagging it stale the moment
-the code commits. Instead a write records the placeholder `@`, and **`dm commit` stamps
-every pending `@`** with `git rev-parse HEAD:path` of the code branch at that moment
-(falling back to `git hash-object` of the working-tree file when the path isn't in HEAD
-yet, so a placeholder never persists — rewriting one is safe only while the record is
-uncommitted worktree state). A pending `@` anchor reads as fresh. Accepted assumption:
-edits made *after* `dm commit` (a later rubocop pass, review fixups) flag the note stale
-like any other drift, and the agent is expected to reconcile notes it just wrote — §8.4
-scopes the gate to exactly these files. The current anchor folds as a **LWW register**
-from the entry's `CR`/`SU`/`RA` records. It is re-stamped **only** by a deliberate
-write — `a`, `u`, or `k` — never by merge, which would re-bless a note as fresh without
-anyone confirming it still matches the code (§7.5).
+**Decision — write-time anchoring** (replaces the companion model's stamp-at-commit).
+Anchors are stamped **at write time** from the working tree — `git hash-object` of
+the file exactly as the agent sees it. No placeholder, no later stamping pass, no
+window in which a note asserts freshness against bytes it never described (this is
+what dissolved review finding A5). The current anchor folds as a **LWW register**
+from the entry's `CR`/`SU`/`RA` records (largest `<rec-id>`). It is re-stamped
+**only** by a deliberate write — `a`, `u`, or `k` — never by sync, which would
+re-bless a note as fresh without anyone confirming it still matches the code.
 
-**Decision — concurrent supersede.** When two branches supersede the same entry
-concurrently, the current body resolves **last-write-wins** by the winning `SU` record's
-`<rec-id>` (the ULID total order above), consistent with the anchor and move-path
-resolution. Both `SU` records
-survive in the log — the loser becomes a sibling revision, never a git conflict — so
-nothing is destroyed and churn stats stay accurate. No keep-both fork is surfaced; the
-merge always yields one clean current body.
+**Decision — concurrent supersede.** When two replicas supersede the same entry
+concurrently, the current body resolves **last-write-wins** by the winning `SU`
+record's `<rec-id>` (the ULID total order above), consistent with anchor resolution.
+Both `SU` records survive in the log — the loser becomes a sibling revision, never a
+conflict — so nothing is destroyed and churn stats stay accurate. No keep-both fork
+is surfaced; the fold always yields one clean current body.
 
-**Decision — tombstone is terminal.** `TB` is absorbing, not a LWW participant: once any
-`TB` record exists for an entry, the entry folds to deleted — a concurrent `SU` loses
-regardless of rec-id order (its record survives in the log, as always, but resolves
-nothing). There is no resurrection: `u`/`k`/`f`/`al` against a tombstoned handle fail at
-write time (`✗ #a3f9c1 deleted`); knowledge worth restoring is re-created with `a`,
-minting a fresh entry.
+**Decision — tombstone is terminal.** `TB` is absorbing, not a LWW participant: once
+any `TB` record exists for an entry, the entry folds to deleted — a concurrent `SU`
+loses regardless of rec-id order (its record survives in the log, as always, but
+resolves nothing). There is no resurrection: `u`/`k`/`f`/`al` against a tombstoned
+handle fail at write time (`✗ #a3f9c1 deleted`); knowledge worth restoring is
+re-created with `a`, minting a fresh entry.
 
-**Decision — `MV` lives on the destination file.** A move carries the whole note-file
-log to the new path and appends `MV <from> <to>`, so a file that moved `a→b→c`
-accumulates both `MV a b` and `MV b c` in its own log — the full provenance chain
-travels with the file. On merge, the union of all `MV` records forms a redirect map
-chased to a **fixpoint** (transitively composing `a→b→c`), sweeping any entries left at
-an intermediate path — including ones a branch added there *unaware of the move* — to
-the terminal path, which then unions by handle. This composes correctly no matter which
-branch each hop came from, because the hops are just unioned log records.
+### 8.4 `dm sync` — the one git-facing verb
 
-**Decision — `MV` and `rm` are recursive for folders.** `mv:old/:new/` moves the entire
-note subtree and appends a **single** folder-scoped record (`MV …rec… old/ new/`, the
-trailing slash marks a folder) to the destination folder's `.dm` file (§2.2) — not one
-record per descendant. In the redirect map a folder record redirects by
-**longest-prefix match**, so it sweeps every entry under `old/` — including notes a
-concurrent branch added at paths the mover never saw, which per-file records could not
-cover — to the corresponding path under `new/`. A more specific record (a file moved
-out of the folder individually) beats the folder prefix at that hop; ties are impossible
-(two records for the *same* path resolve LWW by `<rec-id>` as usual). `rm:path` on a
-folder likewise tombstones every entry homed at the folder node **and all descendants**
-in one command.
+The companion model's outer loop (checkout / merge / commit / push / fetch / unmerged
+/ prune) collapses to a single verb:
 
-**Decision — cycle guard.** Pathological concurrent moves (`a→b` vs `b→a`) could loop
-the fixpoint chase. The transitive close tracks visited paths; if the chain revisits a
-path, it stops and picks the cycle's terminal by the **same LWW total order** used
-everywhere else (largest `<rec-id>` among the `MV` records in the cycle). Every replica
-computes the identical winner, so it collapses deterministically with no new rule.
+> **`dm sync`** = fold pending into a store commit → fetch `refs/dm/store` → CRDT
+> union merge (set-union of records; stat counters merge per §7.2) → push, with a
+> fetch-merge-retry loop on a non-fast-forward race.
 
-**Decision — `rm` discards the chain (accepted degradation).** `rm`-ing a terminal file
-tombstones its accumulated `MV` provenance with it, so a much-later add at a now-orphaned
-old path has nothing to redirect. This is caught by post-merge `dm pre-commit` (§8.4),
-which already demands the agent resolve orphans — a graceful one-step fallback, and
-correct behavior anyway since the path's whole lineage is genuinely gone.
+Properties:
+- **Never conflicts** — union of ULID-named records plus CRDT counters; the retry
+  loop converges because each retry only ever adds.
+- **Never required for local work** — reads see store ∪ pending; a session that
+  never syncs still has full function. Sync is when knowledge is *shared*, not when
+  it becomes real.
+- **Convergence is eventual, not immediate** — two clones can transiently disagree on
+  rule (b) when one has fetched an origin commit the other lacks, until the first
+  memoized verdict record lands in the store (§9.4).
 
-### 7.4 Replica identity
-G-Counters need a stable per-clone **replica id**, kept in **local config** under the
-`dm`-managed `.dm/` home (`.dm/replica`, one per clone, never tracked, §8.1) so it never
-merges. A wide random value (8 base32 chars from a CSPRNG at `dm init`) so collisions
-never need coordinating.
+**Persistence table.** Rows mirror the requirements table in §2.1; "derived" = no
+write, computed at read time from code-repo state + store ∪ pending.
 
-> **Decision:** spend the bytes rather than fight collisions. The replica id is a wide
-> random value (e.g. 8 base32 chars from a CSPRNG at `dm init`, not derived from
-> `user.email`) so collision across any realistic team is negligible and needs no
-> registry or coordination. The cost is a few extra bytes per populated G-Counter cell,
-> which is cheap next to the note bodies and compresses well in git. One caveat:
-> **never copy a clone** — `cp -r` duplicates `.dm/replica`, and two live clones sharing
-> a replica id lose increments under the max-per-replica merge (§8.2). A copied clone
-> must delete `.dm/replica` (or re-run `dm init`) so a fresh id is minted.
+| # | action in code repo (CR) | persistence dm |
+|---|---|---|
+| 1 | repo created, commits exist, dm initialized | create `.git/.dm/` (replica id, empty pending); fetch or create the empty store branch. Nothing in the working tree, nothing on code branches |
+| 2 | note added on file F while on main | append **note record** to **pending** (F's blob anchored, origin = main's HEAD) |
+| 3 | branch B from main; note added on G | same as row 2, origin = B's HEAD. Visibility split main/B: **derived** (ancestry check on origin) |
+| 4 | main progresses; note on H added on main | same as row 2. B's non-seeing of H: **derived** |
+| 5 | B rebased onto main (clean) | **nothing at rebase.** First read on B that finds origin not-ancestor-but-present computes the patch-id match and appends a **landed verdict** (old origin → new commit); every replica inherits |
+| 6 | branch C created; CR still on B | **nothing.** Mutual invisibility: **derived** |
+| 7 | note N added on B, no commit/sync yet | append to **pending** only — dirty blob anchored via the store tree. Immediate visibility falls out of reads consulting store ∪ pending |
+| 8 | B rebased with conflict resolution changing G | **nothing at rebase.** (b): landed verdict as row 5. (a): G's drift is **derived** — anchored blob vs. current tree similarity ⇒ stale flag, recomputed per read, never stored |
+| 9 | B merged into main | true merge: **derived** — origin now ancestor of main, zero writes. Squash: first read appends a **landed verdict** (patch-id/tree containment). G's stale flag persists because it keeps being derived, until `k` re-anchors the note to the current blob |
+| 10 | noted file edited in working tree, uncommitted | **derived** — working blob ≠ anchor ⇒ stale. No write at any point |
+| 11 | noted file renamed/moved | **derived** — anchored blob found at new path (similarity match if also edited ⇒ stale). No re-key record; cache may memoize the match, disposably |
+| 12 | noted file deleted on the current line | **derived** — no match anywhere in tree ⇒ orphaned, worklist is a query. Writes only when the agent acts (tombstone, re-anchor) |
+| 13 | branch B deleted without merging | first read that finds origin unreachable from every local/remote ref and unlanded appends an **abandoned verdict** — persisted so the classification survives GC and replicates |
+| 14 | teammate clones/pulls the same state | `dm sync` on each side; distinct ULID filenames ⇒ conflict-free union. Identical view is **derived** — same store + same refs ⇒ same answers (asterisk: transient divergence until a needed verdict record exists) |
+| 15 | detached HEAD / bisect at old commit | **derived** — same queries against the detached tree and its ancestry. Writes (if any) persist as row 2, origin = the detached commit |
 
-### 7.5 Staleness anchor
-Each entry records the **git blob SHA** of the file it describes, stamped at
-**`dm commit` time** from the code branch's HEAD (placeholder mechanics: §7.3). On read,
-`dm` compares it to the current working-tree blob (`git hash-object`); a mismatch flags
-the entry `⚠stale` — a pending `@` anchor reads as fresh — and ranking (§4.6) sinks
-stale below fresh. Using git's own content address means no separate hashing pass, a
-self-contained per-file anchor (no cross-branch history dependency), and a trivial merge
-rule — the anchor rides `CR`/`SU`/`RA` and folds LWW (§7.3).
+Durable writes happen at exactly three moments: **note records at write time**
+(rows 2/3/4/7/15), **verdict records at first-read-after-history-rewrite**
+(rows 5/8-b/9-squash/13), **store commits at sync** (row 14). Rows 6, 10, 11, 12 are
+pure queries. There is no per-clone mutable state that could make two clones disagree
+except pending, which is by definition not yet shared.
 
-**Decision — granularity.** Whole-file, matching file-level note granularity. A region/
-line anchor would be more precise but rots (line ranges shift under edits); whole-file is
-robust and cheap. The cost — any edit anywhere in a file flags all its notes — is
-absorbed by the housekeeping flow (§8.4): re-blessing via `k` is a one-liner, and the
-stale worklist is scoped to files the session actually touched.
+**What the model pays** (accepted, on the record):
+- **Read-time cost moves up**: similarity matching per unresolved note at read
+  instead of once at a reconciliation gate; mitigated by the disposable cache, but
+  large-repo performance gets sharper — **Q2** (§14).
+- **Convergence is eventual** — the row-14 asterisk above.
+- **Store growth**: anchored blobs ride in the store tree; overhead is only truly
+  uncommitted content (§8.1). Compaction condition: **Q8** (§14).
+- **No forcing function for hygiene**: the worklist replaces the companion model's
+  hard gate; what supplies the pressure to act on it is **Q4** (§14).
 
-**Decision — treatment.** A stale note is reconciled by the agent, never by dm, one of
-three ways: `k` (still valid → re-anchor), `u` (partly wrong → rewrite, re-anchors), or
-`d` (obsolete → tombstone). The `dm pre-commit` gate (§8.4) drives this at session end.
+### 8.5 Replica identity
+G-Counters need a stable per-clone **replica id**, kept in `.git/.dm/replica` (one
+per clone, never tracked, §8.2) so it never merges. A wide random value (8 base32
+chars from a CSPRNG at `dm init`) so collisions never need coordinating.
 
-**Accepted limitation.** Blob-SHA drift detects that *the file's bytes changed*, not that
-*the note became wrong* — the two overlap but differ. So false positives (a reformat or
-unrelated edit flags a still-valid note) and false negatives (a note rots while its file
-is untouched) both exist. This is accepted for v1: `k` is the escape valve for the false
-positive, and no cheaper signal with better fidelity is on offer. Not revisited further.
+> **Decision:** spend the bytes rather than fight collisions. The replica id is a
+> wide random value (not derived from `user.email`) so collision across any realistic
+> team is negligible and needs no registry or coordination. The cost is a few extra
+> bytes per populated G-Counter cell, which is cheap next to the note bodies and
+> compresses well in git. One caveat: **never copy a clone** — `cp -r` duplicates
+> `.git/.dm/replica`, and two live clones sharing a replica id lose increments under
+> the max-per-replica merge (§7.2). A copied clone must delete `.git/.dm/replica` (or
+> re-run `dm init`) so a fresh id is minted. (Test fixtures copy clones deliberately,
+> with pinned replica ids — §11.2.)
 
 ---
 
-## 8. Git Mechanics
+## 9. Read-Time Resolution
 
-### 8.1 `-llm` branch mirroring — explicit commands
+With both anchors stored, resolution is a **two-point comparison**: the note's
+write-time state (anchored blob / path key, origin commit) against the current
+checkout. No history walk is load-bearing — git's diff machinery between origin and
+checkout supplies moves, copies, and similarity pairing on demand. Both halves of the
+visibility rule are two-point git queries at read time; the five states of §2 are
+never stored — they are classifications.
 
-**Decision:** mirroring is **explicit**. The agent/user drives the shadow branches
-through `dm` subcommands, run alongside the corresponding git op on the code branch —
-no hooks, no implicit magic. This is the portable, testable choice, and it keeps `dm`
-in control of shadow refs and merge semantics.
+### 9.1 Rule (a) — is the content present? (file notes)
 
-**Decision — ref storage: real branches under an `llm/` prefix.** A code branch `B` has
-companion `refs/heads/llm/<B>` (`main` → `llm/main`, `topic/x` → `llm/topic/x`).
-Companions are **real branches**, not a custom ref namespace (`refs/dm/…`), because only
-`refs/heads/*` and `refs/tags/*` are reliably accepted, fetched, pushed, protected, and
-PR-able across hosted providers (GitHub / GitLab / Bitbucket) — a custom namespace is
-rejected or made invisible by most of them. The `llm/` prefix keeps companions grouped
-and foldable in branch UIs so the list stays readable. `dm init` guards against a real
-code branch colliding with the prefix. (CI must filter the `llm/*` ref pattern, or
-pushing companions will trigger pipelines.)
+1. **Exact** — anchored blob in the tree at the path hint → visible, fresh.
+2. **Moved** — anchored blob in the tree at another path → visible there, fresh
+   (pure rename/extract — the case path-keying can never handle: extract-file
+   refactors carry their notes).
+3. **Edited** — blob absent; similarity-match it against the checkout (§9.2) →
+   visible at the matched path, flagged `⚠stale`. Staleness is gradable (similarity
+   score) — keep the binary flag for v1.
+4. **Unresolved** — no match → orphaned; hygiene worklist (§9.6). A *visibility*
+   fact, never a gate demanding tombstones.
 
-**Decision — companions live in a `dm`-managed `.dm/` inside the git common dir.** A
-companion is a *different* branch than the code it mirrors and cannot be checked out in
-the code working copy. `dm` keeps its own **linked git worktrees** — one per active code
-branch, each checked out to that branch's companion — plus its replica id and config, in
-a `.dm/` directory located **inside the git common dir** (`git rev-parse
---git-common-dir`, e.g. `.git/.dm/`). Living inside the git dir means git never walks
-into it from any working tree, so `.dm/` is invisible to `git status` in every code
-worktree with **no exclude entry**, and it is inherently **per-clone, shared across all
-code worktrees** — one `.dm/`, one replica id (§7.4). Layout:
+Ambiguity policy (dm detects, agent decides): multiple candidates → prefer the path
+hint, flag the rest; `k`/`u` settles it.
 
-```
-.dm/replica         per-clone replica id + config
-.dm/llm-main/       linked worktree → llm/main
-.dm/llm-topic-x/    linked worktree → llm/topic/x   (code worktree on topic/x)
-.dm/llm-fix-y/      linked worktree → llm/fix/y      (another code worktree)
-```
+### 9.2 Move-with-edit — git rename detection
 
-One worktree per active code branch, directory named after the (slash-sanitised)
-companion branch. All note reads, writes, and merges happen in these worktrees; the code
-working copy is never touched and note/stat churn never appears in code diffs. Companions
-are *not* nested beneath each code worktree: that would duplicate the replica id, inject
-`.dm/` into secondary checkouts, and strand worktree registrations when a code worktree
-is removed. (`git worktree add` accepts a working dir inside the common dir; the fallback,
-if a target git version balks, is a sibling `.dm/` beside the common dir with one local
-exclude entry.)
+Git stores no renames; `git mv` + edit and `rm`/`add` + edit are identical in
+history. Rename-ness is inferred at diff time by content similarity (`-M`, ~50%
+default threshold). This powers resolution layer 3:
 
-Subcommand surface (the batch stdin of §3 handles reads/writes; these are the git-facing
-verbs):
+- A move-with-edit leaves the anchored blob `B` at `old/path` in the origin tree and
+  `B' ≠ B` at `new/path` in the checkout; one similarity diff origin→checkout pairs
+  them. The note surfaces at `new/path` flagged `⚠stale` — correct, since it
+  described the pre-edit content; `k` re-blesses and re-anchors to `B'`.
+- **dm can beat stock git detection**: it only cares about noted paths, so it can
+  afford a lower similarity threshold plus copy detection (`-C`) without whole-tree
+  false-positive risk, and can score candidates against the note's anchored blob
+  directly.
+- **Acceptance is banded, with a uniqueness margin**: ≥ ~80% similarity to the
+  anchored blob *and* the best candidate beating the runner-up by ≥ ~20 points →
+  auto-accept (`⚠stale`); ~50–80%, or a high score with a close runner-up → follow
+  flagged "resolved-by-inference, unconfirmed" for bulk blessing; below ~50% →
+  unresolved. The margin is the load-bearing part: false pairings come from clusters
+  of near-identical candidates (boilerplate, generated code, fixtures), not from a
+  lone wrong file scoring high in isolation. Thin margins tie-break on path-hint
+  affinity (same basename, directory distance). The band numbers are starting
+  guesses — Q1's replay harness doubles as the calibration rig (§11.4).
+- **Nothing persisted**: matches land in the disposable cache; re-running the diff
+  reproduces the answer on any clone.
+
+**Residue handed to the agent** (worklist, never a hard gate): move + heavy rewrite
+below threshold (indistinguishable from delete-and-create — `mv` survives as a verb
+for exactly this, §6.5); file splits with both sides heavily edited (copy detection
+catches at most one side; ambiguity policy applies); true deletions.
+
+Net effect: rename detection turns the companion model's mandatory, every-branch,
+hard-gated manual reconciliation into an automated common case with an agent-reviewed
+remainder.
+
+### 9.3 Folder notes — path as key
+
+(Behavioral requirements: §2.2.)
+
+Folder note = text · **path key** · origin commit. A folder has no stable blob to
+key on — hashing the path is still a path key, just unreadable, and the tree SHA is
+globally volatile by construction (any edit to any file under the folder changes
+it). So the path itself is the key, and the **origin commit supplies the matching
+fingerprint** that the anchored blob supplies for files: the origin's tree at the
+noted path — its tree SHA and member set at write time.
+
+Resolution is the same two-point comparison, origin → checkout:
+
+1. **Exact** — the path exists in the checkout → visible, fresh. Member churn
+   doesn't matter: a folder note describes the place, not the contents.
+2. **Moved, pure** — path absent, but the origin's tree SHA at that path appears
+   elsewhere in the checkout → follow there, fresh (`git mv api/ svc/` with no
+   member edits preserves the tree SHA by construction).
+3. **Moved with churn** — no identical tree; aggregate the file-level rename
+   detection already computed for file notes (§9.2): where did the folder's member
+   files go? Majority prefix mapping (`api/* → svc/*`) → follow, flagged below full
+   agreement. Files pair blobs by similarity; folders aggregate those pairs and vote
+   by prefix.
+4. **Unresolved** — members appear in the diff as deletions (no rename pairs) →
+   folder deleted → orphaned, worklist. Scattered with no majority prefix →
+   ambiguity, agent decides (same policy as multi-candidate file matches).
+
+**Follow heuristic**: the rank-3 vote auto-follows only when three checks pass — a
+**majority of paired members** agrees on one target prefix; the winner beats the
+runner-up prefix by a clear **margin** (6/10 to `svc/` with the other 4 deleted is a
+rename; 6/10 to `api-core/` with 4 in `api-http/` is a split); and the pairs
+**cover** a minimum fraction of the original member set (a 2-member folder with one
+pair and one deletion is 100% of pairs but 50% coverage — too thin to auto-follow).
+Unanimous with full coverage → fresh; passing below that → flagged; no winner →
+ambiguity. Exact fractions ride the same Q1 calibration harness as the file-level
+bands (§9.2).
+
+**Rule (b) is unchanged** — origin ancestry and verdict records apply to folder
+notes verbatim; nothing folder-specific.
+
+**Nothing new persisted**: matches land in the disposable cache; `k` re-anchors the
+path key to the resolved location exactly as it re-anchors a file note to the
+current blob — same verb, same `RA` record, no separate re-path record type. Cost
+piggybacks on the same batched origin→checkout diff file notes already need (Q2
+unaffected).
+
+Edge cases: **split** (`api/` → `api-core/` + `api-http/`) — two prefixes, no
+majority margin → ambiguity, agent picks (duplicating the note is out of scope for
+v1); **absorbed** (contents moved into a pre-existing `lib/` that is mostly foreign
+content) — the vote may be unanimous, but the target may no longer be what the note
+described → follow with an unconfirmed flag regardless of vote strength; **empty
+folders** — git cannot represent them, so a folder containing no files has nothing
+to diff (inherent limit).
+
+### 9.4 Rule (b) — has the origin landed?
+
+Origin ancestor of HEAD → landed here · else a **landed verdict** exists → landed ·
+else origin reachable from another local/remote ref → pending-elsewhere · else
+abandoned (verdict appended on first computation).
+
+**Verdict records** memoize the one thing git structurally forgets — what became of
+rewritten origin lines: **landed** (origin O landed as commit M — squash/rebase,
+matched by patch-id / tree containment) or **abandoned** (origin unreachable from
+all refs, unlanded). Appended lazily by whichever clone first computes the answer;
+union-synced, so every replica inherits it.
+
+**Verdict correction**: wrong verdicts are repaired at the note level in v1, with
+verbs that already exist. Wrong *abandoned* (notes wrongly worklisted — e.g. the
+origin lived on a remote dm couldn't see): `k` from the worklist on the right
+checkout — re-anchoring to current blob + HEAD gives the note a fresh origin that
+resolves by plain ancestry, no verdict consulted. Wrong *landed* (notes wrongly
+surfacing on a line their origin never reached): `k` would bless them there —
+instead `d` here and re-add on the correct branch. Accepted v1 caveats: a verdict is
+per-*origin*, so repair is O(notes sharing that origin), and the stale verdict
+lingers in the store. LWW-overridable verdict records stay a later optimization for
+the many-notes-per-origin case (§15), not a v1 requirement.
+
+### 9.5 Staleness
+
+The write-time anchor is half of every note's identity (§3.1), so staleness is not a
+bolt-on check but the gap the anchors measure: on read, the anchored blob is
+compared against the tree (rule (a)); any mismatch that still resolves surfaces the
+note flagged `⚠stale` (files) or `⚠unconfirmed` (folders, §9.3). Flags are
+*display*, not ranking, in v1 (§5.6).
+
+**Decision — granularity.** Whole-file, matching file-level note granularity. A
+region/line anchor would be more precise but rots (line ranges shift under edits);
+whole-file is robust and cheap. The cost — any edit anywhere in a file flags all its
+notes — is absorbed by `k` being a one-liner. **Hunk-level following** (blame-style
+line attribution) is explicitly out, not deferred: max fidelity, but it requires
+line ranges on notes, which are rot-prone by construction; whole-file blob identity
+is the 90% solution.
+
+**Decision — treatment.** A stale note is reconciled by the agent, never by dm, one
+of three ways: `k` (still valid → re-anchor), `u` (partly wrong → rewrite,
+re-anchors), or `d` (obsolete → tombstone). The worklist (§9.6) surfaces candidates;
+nothing gates.
+
+**Accepted limitation.** Blob drift detects that *the file's bytes changed*, not
+that *the note became wrong* — the two overlap but differ. So false positives (a
+reformat or unrelated edit flags a still-valid note) and false negatives (a note
+rots while its file is untouched) both exist. This is accepted for v1: `k` is the
+escape valve for the false positive, and no cheaper signal with better fidelity is
+on offer. Not revisited further.
+
+### 9.6 Hygiene — worklist, not a gate
+
+`dm worklist` lists everything that wants agent judgment: **orphaned** notes (rule
+(a) layer 4), **abandoned** notes (rule (b)), **ambiguous** follows (splits,
+scatters, multi-candidate matches), **disputed** notes (`FB !`), and — on request —
+stale/unconfirmed notes. It is a pure query over store ∪ pending and the current
+checkout; running it changes nothing.
+
+Unlike the companion model's pre-commit gate, the worklist is **never a forcing
+function and never destructive**: an unresolved note stops *surfacing* in normal
+reads; nothing demands tombstones, so skew or an odd checkout can never pressure the
+agent into destroying live knowledge. The flip side is accepted and named: v1 ships
+no mechanism that *forces* hygiene — what supplies the pressure (ranking, decay,
+review cadence) is open question **Q4** (§14), and it matters more in this
+architecture, not less.
+
+Worklist entries are resolved with the ordinary verbs: `k` (re-anchor/re-bless), `u`
+(rewrite), `d` (tombstone), `mv` (manual re-home), `rm` (retire a dead path).
+Worklist-state notes are addressable by exactly these repair verbs and are invisible
+everywhere else (§5.3).
+
+---
+
+## 10. Agent Integration
+
+### 10.1 Subcommand surface
+
+The batch stdin of §4 handles all reads and writes. The subcommand surface shrinks
+to:
 
 | subcommand | action |
 | --- | --- |
-| `dm init` | create `.dm/` (replica id, config) and the first, **empty** `llm/main`; add the worktree |
-| `dm checkout [B] [--from <llm-branch>]` | point the `.dm/` worktree at `llm/<B>` (current code branch if omitted), creating it from `llm/main` if missing — `--from` names a different parent (§8.5); **requires a content-clean worktree** — run `dm commit` first; pending stat dirt is auto-committed (§8.3) |
-| `dm merge <src>` | deterministically merge the **local** `llm/<src>` into the current companion, into the worktree, **uncommitted** (§8.2); does **not** auto-fetch — run `dm fetch` first for a remote source |
-| `dm commit` | commit the companion worktree — the **only** thing that persists notes and stat deltas (§8.3) |
-| `dm push` / `dm fetch` | move the companion ref to / from `origin` (a plain `git push` never sees `llm/*`) |
-| `dm pre-commit` | the orphan + stale reconciliation gate (§8.4) |
-| `dm unmerged` | list companions whose code branch has landed in the current one but which aren't yet folded in; follow up with `dm merge` per entry (§8.5) |
-| `dm prune <B>` | delete the landed companion `llm/<B>` (local + `origin`) and remove its `.dm/` worktree — shadow counterpart of `git branch -d B` (§8.5) |
+| `dm init` | create `.git/.dm/` (replica id, pending, cache), configure the `refs/dm/*` refspec, fetch or create the empty store (once per clone) |
+| `dm sync` | share: fold pending → fetch → union merge → push with retry (§8.4) |
+| `dm worklist` | the hygiene query (§9.6) |
+| `dm dump [path]` | full raw store state, for tests and debugging (§11.3) |
 
-`dm init` builds the empty `llm/main` with plumbing (empty-tree → `commit-tree` →
-`update-ref`), **not** `git worktree add --orphan` (git 2.42+), to keep the version floor
-low (§10).
+There is no checkout, no merge, no push/fetch pair, no prune, no gate: visibility
+follows the checkout automatically, and sharing is one idempotent verb.
 
-**Decision — commit is agent-driven, merge is hands-off.** Content never auto-commits:
-writes accumulate in the `.dm/` worktree, and the **agent is responsible for running
-`dm commit`** to persist them; stat-only deltas are auto-committed as needed (§8.3).
-Merging needs **no human**:
-`dm merge` is deterministic (§8.2), so the receiving side never resolves a conflict —
-after an explicit `dm fetch`, the companion merges hands-off. The merge lands as a
-*parallel* commit on `llm/<B>` in the same PR / push event as the code merge — **never the
-same commit** as the code, since it is a different branch. `dm merge` does not auto-commit
-either; the uncommitted worktree state is the finished merge awaiting `dm commit`.
+### 10.2 The two loops
 
-A missing companion bootstraps empty (a merge or branch targeting a code branch with no
-`llm/` companion yet starts from an empty shadow tree).
+- **Inner loop** — per-file, continuous, git-unaware. Read-before-touch,
+  write-on-learn. Notes are visible the moment they are written (store ∪ pending).
+- **Outer loop** — per-session. `dm sync` to share and receive; skim `dm worklist`
+  when convenient.
 
-**Decision — branch-alignment check on every invocation.** `dm checkout` binds the
-companion once, but nothing stops a plain `git checkout` afterwards. So **every** `dm`
-invocation (batch or subcommand) first verifies that the code worktree's checked-out
-branch matches the active companion; on mismatch it refuses with
-`✗ code branch is topic/y but companion is llm/topic/x — run dm checkout`. The check is
-one ref read, and it closes the one silent-corruption footgun in the explicit-mirroring
-model: notes read from — or worse, written to — the wrong branch's memory.
-
-### 8.2 Deterministic merge algorithm
-
-`dm merge` computes the merge **in-process** — it reads both branch versions of each
-note file, merges each file per-region, and writes the result to the `.dm/` worktree (§8.1).
-Because mirroring is explicit (§8.1), the merge does **not** rely on git invoking a
-registered merge driver; `dm` owns the merge logic directly.
-
-Per file, both regions merge with no human conflict:
-
-- **header counters** (`i x h`): union replicas, **max per replica**, sum for value,
-- **header `t`**: **max** timestamp (LWW),
-- **body** (entry log): **union** of records by record-id.
-
-No three-way base is consulted — every rule is base-free by construction: deletion is an
-explicit `TB` record (never a missing file), moves leave an `MV` record at the
-destination, counters carry per-replica maxima, and logs union by record-id. Two inputs,
-one deterministic output, regardless of history shape.
-
-**Worked example.** Base `llm/main` has `db/schema.rb` with entries `#e1` and `#e2`.
-Branch X supersedes `#e1` (`SU` rec `…X5`) and tombstones `#e2` (`TB` rec `…X6`); branch
-Y independently supersedes `#e1` (`SU` rec `…Y8`, minted later) and moves the file
-(`MV …Y9 db/schema.rb db/core_schema.rb`). Folding X into Y's companion: union the two
-logs (all five records survive); the redirect map sends every `db/schema.rb` record —
-including X's, written unaware of the move — to `db/core_schema.rb`; `#e1`'s current
-body is `…Y8`'s (largest `SU` rec-id; `…X5` remains a sibling revision); `#e2` is
-deleted (`TB` is terminal, §7.3). Fold the branches in the opposite order and every
-comparison sees the same stored ULIDs — identical result, no base, no conflict.
-
-The merge is nonetheless recorded with **real ancestry**: the `dm commit` that persists
-a `dm merge` writes a **two-parent commit** (current companion tip + merged `llm/<src>`
-tip). Nothing in the fold needs it, but ancestry is what lets `dm unmerged` corroborate
-folds (§8.5) and lets compaction decide when an `MV` or tombstone has sunk below the
-merge-base of all live branches (§11).
-
-Single-valued fields that can be concurrently written resolve **last-write-wins**, but
-by two different total orders (§1.3): the header `t` register orders by wall-clock +
-replica-id, while body-log resolution orders by the winning record's `<rec-id>` ULID —
-the current body of an entry superseded on both sides (**`SU`-vs-`SU`**, §7.3 — both
-`SU` records survive, the loser becomes a sibling revision) and the current staleness
-anchor (`RA`, §7.5). The move-path redirect map composes by fixpoint (§7.3), falling back
-to `<rec-id>` order only to break a cycle.
-
-> **Decision — no merge driver.** A `.gitattributes` merge driver (to keep a *raw* `git
-> merge` of `llm/*` deterministic) is **dropped for v1**: `dm` mediates every companion
-> operation through its own `.dm/` worktree (§8.1), so git's merge machinery is never
-> invoked for notes and no one raw-merges an `llm/*` branch by hand. The rule is simply:
-> never `git merge` a companion — always `dm merge`. A hosted merge button would not run
-> the driver anyway, so it was never protection on the hosted side.
-
-### 8.3 Commit cadence — explicit `dm commit`, auto-committed stats
-
-Both content writes and stat deltas (reads bump the header, §7.1) accumulate in the
-`.dm/` worktree; a `dm` invocation applies all its deltas there once at the end but
-**commits nothing**. Persisting content is a single explicit act: **`dm commit`**. The
-agent runs it to finalize a session and must run it before any branch/merge/push op. It
-also stamps pending `@` staleness anchors (§7.3) and, when persisting a `dm merge`,
-records the merged companion tip as a second parent (§8.2).
-
-> **Decision — content is gated, stats are not.** Worktree dirt is classified by region
-> (§7.1): **content dirt** (body-log changes from `a`/`u`/`d`/`k`/`f`/`al`/`dl`/`mv`/`rm`)
-> versus **stat dirt** (header-only counter/`t` bumps from reads). Content never commits
-> on its own — it coalesces in the worktree and is persisted only by an explicit
-> **`dm commit`**; the agent is responsible for committing before it walks away. To keep
-> the invariant "nothing merges or pushes uncommitted" without magic, `dm checkout` /
-> `dm merge` / `dm push` / `dm pre-commit` **refuse on content dirt** and tell the agent
-> to `dm commit` first, rather than silently committing for it. Stat dirt is exempt:
-> reads must not create commit obligations, so a mere `r:` never blocks a git-facing
-> verb. Any verb that needs a clean tree first **auto-commits pending stat-only changes**
-> as a `dm: stats` commit, and `dm commit` sweeps them in with the content. Header-only
-> auto-commits are safe precisely because the header is a CRDT (§8.2) — they can never
-> conflict, and they contain nothing an agent would want to review before persisting.
-> Commit churn stays on the companion branch (§7.1) and is compacted later (§11).
-
-### 8.4 Renames & orphaned notes — agent-driven reconciliation
-
-**Decision:** the **agent tracks renames**, not dm. dm does not watch the code tree
-or run git rename detection; instead it provides a **pre-commit gate** that forces
-the agent to reconcile the shadow tree against the code tree before every shadow
-commit.
-
-**`dm pre-commit`** compares the shadow tree against the current code working tree
-and lists every **orphaned node** — a note-bearing path (file or folder) whose mirror
-path no longer exists in the code tree. Orphans are **collapsed to the highest orphaned
-ancestor**: a renamed or deleted directory reports one line
-(`api/ — 12 note-bearing paths`), not twelve. The gate exits non-zero while any orphan
-is unresolved, so the agent must act. Each orphan is resolved one of two ways:
-
-- **`mv:old:new`** — the code moved; relocate the node's notes to the new mirror
-  path (recursive for folders, §7.3). Entry handles are preserved (§5.2), so links and
-  back-links survive.
-- **`rm:path`** — the code was genuinely deleted; tombstone the node's entries
-  (recursive for folders). This is the node-level counterpart to `d:#handle` (which
-  tombstones one entry): it tombstones every entry homed at a vanished path in one move.
-
-Resolution can be **iterative**: after a recursive `mv:api/:svc/`, a descendant that
-actually moved somewhere else (`api/x.rb` → `lib/x.rb`) is still orphaned — now at
-`svc/x.rb` — and surfaces when the gate is re-run, to be fixed with its own `mv`. No
-extra machinery: the gate already loops until it exits zero.
-
-`mv` and `rm` are ordinary **batch-stdin commands** (§3.2) — the agent feeds them into
-a `dm` batch like any read or write. `dm pre-commit` is a **subcommand** (like `dm
-merge`): the gate itself, run at the end of a work session before committing the `-llm`
-branch. Reconciling on every commit keeps the shadow tree consistent with the code tree,
-which is what makes the deterministic merge tractable: both sides of a merge are
-self-consistent snapshots.
-
-**Decision — the gate also covers staleness (§7.5).** Besides orphans, `dm pre-commit`
-emits a **stale worklist**: notes whose blob-SHA anchor no longer matches the current
-file. It is **scoped to the working set** — only notes homed on code files this branch
-changed (diff vs the merge-base) — so the list is short and every item is one the agent
-has fresh context to judge. Notes on untouched files stay flagged on read but never enter
-the gate. Each stale note is resolved with `k` (still valid → re-anchor), `u` (rewrite),
-or `d` (tombstone). Both worklists are a **hard gate**: `dm pre-commit` exits non-zero
-until every orphan *and* every scoped-stale note is resolved. Scoping is what earns the
-hard gate — it makes the list actionable rather than noise, so "reconcile the
-consequences of what you changed this session" applies uniformly to moves and drift.
-
-**Decision — concurrent moves.** A move writes a mergeable **`MV` record** (§7.3)
-naming the prior path; the merge **follows the entry handle, not the path**, and
-consolidates all of an entry's records at the **newest path** — the destination of the
-move with the largest `<rec-id>`, resolving conflicting destinations (`a→b` vs `a→c`) by
-that same ULID total order (§7.3/§8.2). The `MV` record is what makes move-vs-edit safe: a branch that
-added notes at the old path *unaware of the move* has them swept to the new path on
-merge instead of orphaning at a dead location. So a "moved" pointer does survive — but
-only as **internal merge metadata**, never an agent-facing redirect: reads never
-resolve an old path (§4), and once an `MV` record sinks below the merge-base of all
-live branches it is compacted away (§11), like a tombstone.
-
-> **Decided:** `dm pre-commit` reports **orphans and scoped-stale notes** (both a hard
-> gate). Detecting *new* code files with no shadow node (to nudge note-taking) is out of
-> scope for v1.
-
-### 8.5 Branch lifecycle — two loops
-
-The verbs above split into two cadences, and naming that split is the whole operating
-model. **`dm` is entirely agent-operated:** the developer runs `dm init` once per clone
-and otherwise does normal git; the agent drives every other `dm` op, mirroring each git
-op with its shadow counterpart *at the moment it happens* (no hooks, §8.1).
-
-- **Inner loop** — per-file, continuous, git-unaware. Read-before-touch, write-on-learn.
-  Writes accumulate uncommitted in the worktree; nothing persists until `dm commit` (§8.3).
-- **Outer loop** — per-session / per-branch, git-bound. The `checkout / pre-commit /
-  commit / push / merge / unmerged / prune` verbs fire at branch boundaries.
-
-| Lifecycle moment | Code side | Shadow side (agent runs) |
+| Lifecycle moment | Code side | dm side (agent runs) |
 | --- | --- | --- |
 | clone setup | `git clone` | `dm init` (once) |
-| start work on a branch | `git checkout -b topic/x` | `dm checkout` (infers branch, creates companion from `llm/main` if missing; `--from` overrides) |
+| branch / rebase / squash / merge / switch | plain git, any strategy | **nothing** — visibility follows automatically (§2) |
 | working | edit + `git commit` | **inner loop**: `r:` before touching, `a`/`u`/`d`/`f`/`al` on learning |
-| wrap up / open PR | `git push` | `dm pre-commit` → resolve orphans (`mv`/`rm`) + scoped-stale (`k`/`u`/`d`) → `dm commit` → `dm push` |
-| land locally | `git merge topic/x` into `main` | `dm merge llm/topic/x` → `dm commit` → `dm push` → `dm prune topic/x` |
-| land via hosted button | PR merged remotely | (later, on `llm/main`) `dm unmerged` → `dm merge` each → `dm commit` → `dm push` → `dm prune` |
+| wrap up / share | `git push` | `dm sync`; skim `dm worklist`, resolve what has fresh context (`k`/`u`/`d`/`mv`/`rm`) |
 
 **Inner-loop discipline.**
-1. **Read before touching** a file: `r:path` for the surface, `r:path:1` to orient with
-   parent/arch notes inline, or `s:path:t1|t2` to grep the assembled context when a file
-   sits under many arch notes.
-2. **Write when you learn something durable** you'd want back on this branch later — a
-   gotcha, a non-obvious constraint, a why-it's-this-way — not a restatement of code.
-3. **Correct what you find wrong**: `u` to fix, `d` to remove, `f:#h:!:reason` to flag
-   when you can't fix now, `k` to re-bless a stale-flagged note you've verified.
+1. **Read before touching** a file: `r:path` for the surface, `r:path:1` to orient
+   with parent/arch notes inline, or `s:path:t1|t2` to grep the assembled context
+   when a file sits under many arch notes.
+2. **Write when you learn something durable** you'd want back on this branch later —
+   a gotcha, a non-obvious constraint, a why-it's-this-way — not a restatement of
+   code.
+3. **Correct what you find wrong**: `u` to fix, `d` to remove, `f:#h:!:reason` to
+   flag when you can't fix now, `k` to re-bless a stale-flagged note you've verified.
 
-**Decision — companion parent on `dm checkout`.** When `dm checkout` must create a
-missing `llm/<B>`, it branches from **`llm/main`** by default (an empty shadow tree if
-even that is missing); an optional parameter names a different parent explicitly —
-`dm checkout topic/child --from llm/topic/parent` — for a topic branched off another
-topic. Fork-point *discovery* (guessing the parent via `git merge-base`) is dropped: it
-cannot distinguish topic-off-topic from topic-off-main without per-repo configuration,
-so the default covers the common case and the exception is one explicit flag.
+### 10.3 The `agents.md` prompt
 
-**Decision — `dm unmerged` lists what to fold.** The founding invariant (§2.1) requires
-every code merge into `main` to be mirrored by `llm/<B>` → `llm/main`. Local merges are
-mirrored directly (`dm merge` right after `git merge`). Merges via a **hosted PR button**
-are observed by no local agent, so — run on `llm/main` after pulling `main` — `dm
-unmerged` **lists** every companion `llm/<B>` whose notes are not yet in `llm/main`,
-marked **landed** (`✓`, detection below) or **undetermined** (`?`). It does **not** fold
-anything itself: the agent
-follows up with `dm merge llm/<B>` per listed entry, then `dm commit` → `dm push` →
-`dm prune <B>`. Keeping detection (`unmerged`) separate from the mutation (`merge`) keeps
-`dm` free of the one hands-off write the rest of the model avoids, and lets the agent skip
-a companion it recognizes as abandoned.
-
-**Detection — ancestry + patch-id, never subject text.** Hosted providers often
-**rebase or squash** before merging, so `B`'s commits are rewritten and `B`'s tip is
-*not* an ancestor of `main` — `git branch --merged` misses it. Detection is purely
-local and **content-based**; parsing merge-commit subjects (`Merge branch 'topic/x'`,
-`Merge pull request #N from …`) was considered and rejected — subjects are free text,
-editable, and squash-message templates vary per host. Three detectors, checked over
-`main`'s first-parent history since the companion's last fold:
-
-- **true merge** — a merge commit whose second parent is, or reaches, the code branch's
-  tip: pure ancestry, definitive (a rejected PR never produces a merge commit on
-  `main`).
-- **squash merge** — the `git patch-id` of the branch's *whole range diff*
-  (`merge-base..tip` taken as one combined patch) equals the patch-id of a single
-  commit on `main`: an untouched squash commit is exactly that combined patch.
-- **rebase merge** — every commit in `merge-base..tip` is patch-id-equivalent to a
-  commit on `main` (`git cherry` reports nothing unmatched).
-
-A companion matched by any detector is listed **landed** (`✓`). Every other unfolded
-companion is **undetermined** (`?`); the tempting fallback — "the code branch was
-deleted on `origin`" — cannot distinguish a merged PR from one closed without merging,
-so v1 does not guess.
-
-**Accepted edge cases** (each degrades to `?` — except the last, the one false-`✓`
-path):
-
-- **diff modified in flight** — conflict resolutions during the merge, a hosted
-  "update branch" back-merge into the PR, or maintainer edits change the landed patch;
-  patch-ids no longer match → `?`.
-- **empty range** — a branch whose `merge-base..tip` diff is empty would match anything
-  vacuously; skipped → `?`.
-- **deleted local ref** — all three detectors need the code branch's tip to compute
-  ancestry / `merge-base..tip`; if `topic/x` was already deleted locally, the companion
-  is listed `?` (hence the lifecycle order: fold first, `dm prune` last).
-- **patch-id coincidence** — an *identical* diff landing on `main` via an unrelated
-  commit marks a never-merged branch landed. Accepted: the companion's notes then
-  describe changes that genuinely are in `main`, so the fold is as harmless as any
-  early fold of a landing branch (idempotent union, §8.2).
-
-**Accepted caveat:** where all three detectors miss, the agent must know from outside
-git (the PR, the user) that a `?` companion landed before folding it. Folding early is
-harmless for a branch that *does* eventually land — the fold is an **idempotent CRDT
-union** (§8.2), so a re-fold yields the identical result — but folding a branch that
-never lands pollutes `llm/main`, which is exactly why `?` entries are never auto-folded.
-The CI end state (§11) sidesteps detection entirely: the merge event names the source
-branch, so CI can `dm merge llm/<that>` directly regardless of rebase/squash.
-
-**Decision — `dm prune <B>`.** After `llm/<B>` is folded into `llm/main`, `dm prune <B>`
-deletes the companion branch (local + `origin`) and removes its `.dm/` worktree — the
-shadow counterpart of `git branch -d B`. Always agent-invoked, one companion at a time.
-
-### 8.6 Agent integration — the `agents.md` prompt
-
-This is the canonical block a consuming repo copies into its own `AGENTS.md` so the agent
-reads `dm` output correctly and follows the lifecycle. It is deliberately concise.
+This is the canonical block a consuming repo copies into its own `AGENTS.md` so the
+agent reads `dm` output correctly and follows the lifecycle. It is deliberately
+concise.
 
 > #### Dark Matter (`dm`) — your memory about this codebase
 >
-> `dm` stores notes *about* the code (gotchas, architecture rationale, dev/ops know-how)
-> on a shadow git branch that tracks your current branch. Read before you touch a file;
-> write when you learn something you'd want back later.
+> `dm` stores notes *about* the code (gotchas, architecture rationale, dev/ops
+> know-how) that automatically surface on the branches and commits where they apply.
+> Read before you touch a file; write when you learn something you'd want back later.
 >
-> **Read first.** Before editing `foo/bar.rb`: `r:foo/bar.rb` returns a *surface* — own
-> notes (one-line previews), parent/arch notes, links, and an inventory footer. It's a
-> map, not a dump. Drill with `r:#handle` (full body of one entry) or `s:foo/bar.rb:t1|t2`
-> (grep the file's whole note-context; `|`=OR, `+`=AND).
+> **Read first.** Before editing `foo/bar.rb`: `r:foo/bar.rb` returns a *surface* —
+> own notes (one-line previews), parent/arch notes, links, and an inventory footer.
+> It's a map, not a dump. Drill with `r:#handle` (full body of one entry) or
+> `s:foo/bar.rb:t1|t2` (grep the file's whole note-context; `|`=OR, `+`=AND).
 >
-> **Write on learning.** `a:path:subj:body` (subj: `c` code/behavior · `a` architecture ·
-> `d` dev/build/test · `o` ops). `u:#handle:body` supersedes · `d:#handle` removes ·
-> `k:#handle` re-blesses a stale note · `f:#handle:!:reason` flags one wrong.
+> **Write on learning.** `a:path:subj:body` (subj: `c` code/behavior · `a`
+> architecture · `d` dev/build/test · `o` ops). `u:#handle:body` supersedes ·
+> `d:#handle` removes · `k:#handle` re-blesses a stale note · `f:#handle:!:reason`
+> flags one wrong.
 >
-> **Link related notes.** Links are the only way notes relate — `al:#a:#b[:why]` connects
-> two entries (directed `a→b`, optional comment); `dl:#a:#b` removes one. Link a note to
-> the ones it depends on, contradicts, or elaborates: an architecture note (`a`) links to
-> the files it governs so they surface it as `← linked-from`; a gotcha links to the note
-> explaining the underlying cause. Follow any `→`/`←` you see with `r:#handle`.
+> **Link related notes.** Links are the only way notes relate — `al:#a:#b[:why]`
+> connects two entries (directed `a→b`, optional comment); `dl:#a:#b` removes one.
+> Link a note to the ones it depends on, contradicts, or elaborates: an architecture
+> note (`a`) links to the files it governs so they surface it as `← linked-from`; a
+> gotcha links to the note explaining the underlying cause. Follow any `→`/`←` you
+> see with `r:#handle`.
 >
-> **Output.** Blocks split on `▸` (command echo, then raw content); `◾` ends the stream.
-> Glyphs: `→` link · `↑` parent note · `←` linked-from · `⚠stale` (file changed since the
-> note) · `⚠disputed` (flagged wrong). `(+N lines)` = hidden size. Handles `#a3f9c1` are
+> **Output.** Blocks split on `▸` (command echo, then raw content); `◾` ends the
+> stream. Glyphs: `→` link · `↑` parent note · `←` linked-from · `⚠stale` (file
+> changed since the note) · `⚠unconfirmed` (followed a move by inference) ·
+> `⚠disputed` (flagged wrong). `(+N lines)` = hidden size. Handles `#a3f9c1` are
 > stable — copy them into later commands.
 >
-> **Batch over stdin**, one command per line, body always last (`:` in a body needs no
-> escaping; trailing `\` continues to the next line):
+> **Batch over stdin**, one command per line, body always last (`:` in a body needs
+> no escaping; trailing `\` continues to the next line):
 > ```
 > dm <<EOF
 > r:api/handler.rb
@@ -992,109 +1041,235 @@ reads `dm` output correctly and follows the lifecycle. It is deliberately concis
 > EOF
 > ```
 >
-> **Session lifecycle** — mirror your git ops: start / new branch → `dm checkout`; before
-> a PR → `dm pre-commit` (resolve orphans with `mv`/`rm`, stale notes with `k`/`u`/`d`)
-> then `dm commit` then `dm push`; when your branch merges to `main` → `dm merge
-> llm/<branch>` then `dm commit && dm push` (after a hosted merge, run `dm unmerged` on
-> `llm/main` and `dm merge` each listed companion). **Nothing persists until you run `dm
-> commit`** — it saves both your notes and read-stats, so commit before any merge/push and
-> at session end.
+> **Session lifecycle** — there is nothing to mirror: notes follow your branch
+> through rebases, squashes, and merges automatically, and your own notes are usable
+> the moment you write them. Run **`dm sync`** at session end (and whenever you want
+> teammates' notes) to share both notes and read-stats. Skim **`dm worklist`**
+> occasionally and resolve what you have context for: `k` (still valid), `u`
+> (rewrite), `d` (obsolete), `mv`/`rm` (re-home / retire a path).
 
 ---
 
-## 9. Testing
+## 11. Testing
 
-### 9.1 E2E harness
+### 11.1 E2E harness
 Tests set up a **real git repo**, drive `dm` via stdin, and assert on both stdout and
-the resulting shadow-tree state. This is the primary test strategy.
+the resulting store state. This is the primary test strategy.
 
-### 9.2 Fixture repo & the base branch
-All scenarios branch off a single **well-known base**: `base` (code) + `llm/base`
-(shadow, pre-seeded with a known note set). Branching off a shared base means every
-scenario inherits identical handles, paths, and stats, so per-scenario setup is one
-checkout, not a long command script — and discovery/merge tests stop depending on the
-write commands being correct just to reach their starting state.
+### 11.2 Fixture repository
+
+> **Decision (2026-07-19) — the fixture is a whole repository, copied per test.**
+> The well-known-base idea is kept: every scenario starts from an identical,
+> pre-seeded state so it inherits known handles, paths, and stats, and per-scenario
+> setup is one copy, not a long command script. Under the single-store model that
+> base is no longer a branch pair but an **entire local repository**: code history
+> with branches in each §2 state, the seeded store (`refs/dm/store`), and pending.
+> Each scenario **copies the repo directory** — cheap and local. Copy-per-test
+> replaces the companion-era worktree-per-test: worktrees share refs, and scenarios
+> must mutate `refs/dm/store` and branch refs independently. Copying a clone
+> duplicates the replica id (§8.5's caveat) — deliberate and harmless here, since
+> fixture replica ids are pinned anyway.
 
 The fixture is **built by a command** (`dm fixture build`) from a single declarative
-manifest — code tree + notes + seeded stats — so a storage-format change is absorbed in
-one place. It deliberately exercises every disclosure dimension so discovery tests just
-reuse it: a file with mixed-subject own notes; a nested folder tree (≥2 ancestor
-levels); an architecture note at an LCA folder linking members (back-links); an entry
-with pre-seeded stats (ranking + `⚠disputed`); a hash-drifted entry (`⚠stale`); a
-superseded entry (rev ≥2) and a tombstoned one; and a two-replica header (G-Counter
-merge). Where possible it reuses the worked examples from §3–§6 (`api/handler.rb`, the
-`api/` arch note `#f22e90`, `db/schema.rb #a3f9c1`) so the doc's illustrative output is
-literal golden output.
+manifest — code history + notes + seeded stats — so a storage-format change is
+absorbed in one place. It exercises every disclosure dimension: a file with
+mixed-subject own notes; a nested folder tree (≥2 ancestor levels); an architecture
+note at an LCA folder linking members (back-links); an entry with pre-seeded stats
+(ranking + `⚠disputed`); a superseded entry (rev ≥2) and a tombstoned one; a
+two-replica stat row (G-Counter merge). And the resolution surface: a note in each
+§2 visibility state (an unmerged topic branch, a rebased branch, a squash-landed
+branch with its landed verdict, an abandoned branch, a drifted file → `⚠stale`); a
+pure rename; a move-with-edit inside and below the §9.2 bands; a folder split
+ambiguity. Where possible it reuses the worked examples from §4–§7
+(`api/handler.rb`, the `api/` arch note `#f22e90`, `db/schema.rb #a3f9c1`) so the
+doc's illustrative output is literal golden output.
 
 **Guard tests.** Because the fixture is built *through* `dm` (`a` etc.) rather than
-seeded at the storage layer, a small set of guard tests asserts that the build commands
-themselves work. A regression in `a` then surfaces as a focused guard failure, not as
-every scenario mysteriously breaking.
+seeded at the storage layer, a small set of guard tests asserts that the build
+commands themselves work. A regression in `a` then surfaces as a focused guard
+failure, not as every scenario mysteriously breaking.
 
-**Isolation: worktree-per-test.** Each scenario runs in its own `git worktree` off the
-fixture, so tests cannot mutate the shared base and can run in parallel.
+**Determinism.** The harness pins every source of nondeterminism — fixed replica
+ids, a seeded/deterministic id source, an injectable clock (so LWW outcomes are
+assertable), fixed commit timestamps/authors (so every blob/commit SHA and patch-id
+in the fixture is stable), and stable sort order — otherwise none of the golden
+output is reproducible.
 
-**Determinism.** The harness pins every source of nondeterminism — fixed replica id, a
-seeded/deterministic id source, an injectable clock (so LWW `t` is assertable), and
-stable sort order — otherwise none of the golden output is reproducible.
+### 11.3 `dm dump`
+`dm dump [path]` prints the **full raw state** of store ∪ pending — every record
+(with resolved handles) and every stat row (per-replica counters, `t`) — in a
+deterministic, un-budgeted, unranked, human/test-readable form. It is the opposite
+of the agent-facing read (§4.3): no progressive disclosure, no size hints, no
+ranking, just the ground truth. Tests use it to assert store state structurally and
+to snapshot sync results; devs use it to inspect what actually landed.
 
-### 9.3 `dm dump`
-`dm dump [path]` prints the **full raw state** of the shadow tree — every note file's
-header (per-replica counters, `t`) and body (the append-log with resolved handles) — in
-a deterministic, un-budgeted, unranked, human/test-readable form. It is the opposite of
-the agent-facing read (§3.3): no progressive disclosure, no size hints, no ranking, just
-the ground truth on disk. Tests use it to assert shadow-tree state structurally and to
-snapshot merge results; devs use it to inspect what actually landed.
-
-### 9.4 Scenarios
+### 11.4 Scenarios
 - **CRUD** — create/supersede/tombstone; handle stability across revisions.
-- **Discovery** — surface previews, cost hints, drill-by-handle, depth modifier, search.
-- **Two-phase** — syntactically bad batch writes nothing; per-command errors isolated.
-- **Branch** — companion `llm/*` branches off correctly; empty bootstrap.
-- **Merge** — deterministic merge produces no conflict; body union + header counter merge.
-- **Determinism** — same inputs, different orders/replicas → identical merged result.
-- **Stats merge** — G-Counters sum across replicas; LWW timestamp picks the max.
-- **Renames** — `dm pre-commit` lists orphans; `dm mv` relocates notes preserving
-  handles/links; `dm rm` tombstones a deleted node's entries.
+- **Discovery** — surface previews, cost hints, drill-by-handle, depth modifier,
+  search.
+- **Two-phase** — syntactically bad batch writes nothing; per-command errors
+  isolated.
+- **Visibility** — replay the §2 file and folder tables **row by row**; the tables
+  are the acceptance spec.
+- **Resolution** — rename bands (§9.2), folder follow heuristic and edge cases
+  (§9.3), ambiguity policy, path-hint preference.
+- **Verdicts** — squash and rebase landings, abandoned branches, wrong-verdict
+  repair (§9.4).
+- **Sync** — two replicas, union convergence, non-ff retry, stat counter merge
+  (G-Counters sum across replicas; LWW `t` picks the max).
+- **Determinism** — same records, different sync orders/replicas → identical folded
+  state.
 - **Guard** — the fixture build commands (`a`, seed path) produce the expected base.
+- **Replay / calibration** (Q1) — replay a real repo's history against seeded notes;
+  measure the fraction resolving via §9.1 layers 1–3; calibrate the §9.2/§9.3 bands.
+  Doubles as the validation gate for the architecture itself (§14).
 
 ---
 
-## 10. Tech Stack
+## 12. Tech Stack
 `dm` is a single **Go** binary. No runtime dependencies beyond git.
 
-> **Decision — minimum git 2.15.** The merge is custom (CRDT union, §8.2), so `dm` never
-> uses git's textual 3-way merge or `git merge-tree --write-tree` (git 2.38+) — it only
-> reads blob versions and writes trees, ancient plumbing. The floor is set by `git
-> worktree` robustness (§8.1, §9.2) at ~2.15, and `dm init` creates the empty companion
-> with plumbing rather than `git worktree add --orphan` (git 2.42+) to stay there. No
-> separate merge driver or hooks ship — `dm` mediates everything itself (§8.1 / §8.2).
+> **Decision — minimum git 2.15.** Everything used is ancient, stable plumbing:
+> `hash-object`, `rev-parse`/ancestry checks, `diff` rename/copy detection
+> (`-M`/`-C`), `patch-id`, custom refs push/fetch, `commit-tree`/`update-ref` for
+> store commits. The companion model's `git worktree` dependency — which originally
+> set the floor — is gone; 2.15 is retained as a conservative floor since nothing
+> requires newer.
 
 ---
 
-## 11. Deferred / Open Questions
-- **budget-fill retrieval** — `r:path` auto-expands top-ranked items to fill ~N tokens;
-  wait until usage-stat ranking makes "dm decides" trustworthy.
-- **weighted scoring function** — v1 ranks on proximity + subject priority only (§4.6);
-  folding staleness, recency, and usage signals (expansion rate, usefulness ratio) into a
-  weighted score waits until there's real usage data to tune the weights against.
-- **compaction** — rewrite files to fold superseded revisions, drop tombstoned rows,
-  prune settled `MV` records (once below the merge-base of all live branches), coalesce
-  counters; must be coordinated to not lose concurrent increments.
-- **team-shared vs per-clone stats** — already merged via CRDT header; revisit if
+## 13. Rejected — Companion-Branch Mirroring
+
+Until 2026-07-19 this document specified a different architecture: every code branch
+`B` had a **companion branch** `llm/<B>` whose tree mirrored the code's directory
+structure and carried the notes, held in dm-managed worktrees under `.git/.dm/`,
+driven by an explicit verb choreography (`dm checkout` / `merge` / `commit` / `push`
+/ `fetch` / `unmerged` / `prune`) that the agent ran alongside each git operation —
+plus a hard `dm pre-commit` gate forcing orphan/staleness reconciliation before
+every shadow commit, and patch-id detection to recognize branches landed by hosted
+rebase/squash buttons.
+
+**Why it was rejected.** Adversarial review ([review.md](review.md)) found the
+storage core sound but produced four critical findings — **A1** (the orphan hard
+gate destroys live knowledge under tree skew), **A3** (same-companion divergence
+across clones has no merge path), **A4** (alignment-check/content-dirt deadlock),
+**A5** (within-session anchor drift silently blessed at commit-stamping time) — that
+all trace to one architectural stance: **dm sitting outside git, mirroring branch
+topology and trying to observe git events after the fact.** A patch package (a
+`Dm-Code` binding trailer plus recorder hooks) was designed and judged to be
+stabilizing machinery for an unstable stance. The adopted model deletes the problems
+instead of patching them: content + origin anchoring makes visibility a pure
+read-time query (§2, §9), so there is no topology to mirror, no fold to choreograph,
+no gate that can destroy data (A1 → a never-destructive worklist, §9.6), one CRDT
+store with a sync retry loop (A3 → §8.4), no checkout binding to misalign (A4 →
+nothing to align), and write-time anchoring (A5 → no stamping window, §8.3). It also
+needs none of the sync mechanisms surveyed in
+[existing_git_branch_follow_strategies.md](existing_git_branch_follow_strategies.md)
+— nothing observes git; queries just look.
+
+**What survived** is everything the review found sound: the append-only record/CRDT
+layer (§8.3), handles (§3.5), the batch CLI (§4), and progressive disclosure (§5).
+The spike that developed the adopted model is preserved in
+[spike_content_adressable.md](archive/spike_content_adressable.md); the fallback, had it
+failed validation, was the trailer + recorder-hooks package on companions.
+
+---
+
+## 14. Open Questions
+
+Carried from the spike (validation gates — run before/while building v1):
+
+- **Q1 — does resolution follow ordinary edit churn?** If everyday editing routinely
+  drops notes to layer 4 (unresolved) of §9.1, the model fails regardless of the
+  merge story. Metric: fraction of notes resolving via layers 1–3 across a real
+  repo's history replay — which doubles as the calibration rig for the
+  acceptance-band fractions (§9.2, §9.3, §11.4).
+- **Q2 — read-path performance on large repos.** All resolution cost now sits on
+  reads; per-note similarity queries must amortize through the one batched
+  origin→checkout diff that file and folder resolution share, plus the disposable
+  cache (§8.2).
+- **Q3 — split/absorbed UX.** The agent-facing flow for the folder cases dm refuses
+  to auto-follow (split) or follows unconfirmed (absorbed) (§9.3).
+- **Q4 — hygiene without a hard gate.** The gate became an optional worklist and
+  stale/orphaned are mere classifications — what supplies the forcing function
+  (ranking, decay, review cadence)? Review finding D1 grows *more* important under
+  this model (§9.6).
+- **Q5 — strict lineage vs. bisect** (§2.1 row 15). Strict reading hides notes
+  written later on main itself from old-main checkouts — during bisect one might
+  *want* later knowledge about unchanged files. Strict stands until decided.
+
+From adopting the architecture (surfaced in the 2026-07-19 comparison):
+
+- **Q6 — physical store layout for stats (and path fields).** The
+  one-file-per-record store has no mutable region for the G-Counter/`t` stat rows
+  (§7.2); a layout is needed (candidate: per-entry, per-replica stat files — each
+  replica writes only its own, so union is conflict-free and max-per-replica is
+  trivial). The same decision covers the encoding of path-valued fixed fields in
+  records (§8.3, review nit E3) and the stat-sync cadence.
+- **Q7 — record form of manual `mv`/`rm`.** The companion model's `MV`
+  redirect-map/fixpoint machinery is gone; `mv` survives as the manual-residue verb
+  (§6.5). What it appends — per-entry re-anchor (`RA` with new path) vs. a
+  path-scoped record — and how recursive folder `mv` is represented, is unsettled.
+- **Q8 — compaction condition.** The old trigger ("sunk below the merge-base of all
+  live companion branches") no longer exists. When may superseded revisions,
+  tombstoned entries, stale verdicts, and no-longer-referenced anchored blobs be
+  dropped from the single store, without losing concurrent increments or breaking
+  row-14 convergence (§8.4)?
+
+Carried from the review (apply to both architectures — [review.md](review.md)):
+
+- **Q9 (A2) — handle minting degenerates under monotonic ULIDs.** Same-millisecond
+  ids differ only in their lowest bits, so 6-char random-tail prefixes collide by
+  construction within a batch. Likely fix: mint handles from their own randomness —
+  conceding the handle is stored state, not derived. Interacts with Q10.
+- **Q10 (B5) — what the stored id field holds.** Full ULID vs. handle in records and
+  stat rows: full ULIDs make ambiguity resolution work but the doc's examples show
+  handles; keying on handles turns a cross-replica handle collision into record
+  interleaving — corruption, not ambiguity. Must be pinned.
+- **Q11 (C1, residue) — back-link / handle-resolution index.** One-file-per-record
+  answers "which log does `LN` live in," but `r:#handle` and `← linked-from` still
+  need either a full-store scan per read or an index (cacheable, §8.2) that is not
+  yet specified.
+- **Q12 (C2) — same-batch backreference.** `a` mints the handle in *output*, so
+  create-then-link costs two round-trips in a design built to amortize round-trips.
+  Fix direction: client-supplied ids or positional backreferences (`al:$1:#b`).
+- **Q13 (C3) — intra-clone concurrency.** Two `dm` processes in one clone share a
+  replica id and pending dir with no locking: lost counter increments, interleaved
+  writes, per-process monotonic minting that isn't monotonic across processes. A
+  lockfile in `.git/.dm/` at minimum.
+- **Q14 (D2) — whole-store search.** "What do I know about deploys?" has no verb:
+  `s` needs a path, and `o`/`d` knowledge homed on folders is exactly what you don't
+  discover by reading a code file. Dropped under the companion model; the single
+  global store makes it cheap to express — revisit rather than drop (§5.5).
+
+---
+
+## 15. Deferred
+
+- **budget-fill retrieval** — `r:path` auto-expands top-ranked items to fill ~N
+  tokens; wait until usage-stat ranking makes "dm decides" trustworthy.
+- **weighted scoring function** — v1 ranks on proximity + subject priority only
+  (§5.6); folding staleness, recency, and usage signals (expansion rate, usefulness
+  ratio, feedback) into a weighted score waits until there's real usage data to tune
+  the weights against.
+- **compaction** — fold superseded revisions, drop tombstoned rows and settled
+  verdicts, prune unreferenced anchored blobs, coalesce counters; must be
+  coordinated to not lose concurrent increments. Its safety condition is **Q8**.
+- **Lamport counters in record headers** — retire the wall-clock caveat on
+  ULID-ordered LWW folds (§8.3) without changing transport.
+- **LWW-overridable verdict records** — batch repair for the many-notes-per-origin
+  case (§9.4); v1 repairs at the note level.
+- **team-shared vs per-clone stats** — already merged via CRDT counters; revisit if
   per-clone granularity turns out to matter.
-- **duplicate signal** — none for v1; agent cleans up via CRUD.
-- **whole-store search** — dropped, not deferred: `s` is always context-scoped
-  (`AND`/`OR` both land in v1, §4.5).
+- **duplicate signal** — none for v1; agent cleans up via CRUD (§6.3).
 - **oversized-entry pagination** — expansion returns full body for v1; paginate huge
   entries later with a continuation handle.
-- **extensible subjects** — fixed c/a/d/o enum for v1.
-- **CI-driven merge-to-main** — v1 reconciles hosted PR-button merges with the local
-  `dm unmerged` + `dm merge` flow (§8.5); the scalable end state is a CI job on code
-  `main` that folds the merged branch's companion into `llm/main` headless. CI sidesteps
-  rebase/squash detection entirely — the merge event names the source branch, so it runs
-  `dm merge llm/<that>` directly. Deferred: it's infra, and the job must be scoped so `llm/*` pushes
-  don't themselves trigger pipelines (§8.1).
-- **staleness fidelity** — *not* deferred; settled as an **accepted limitation** (§7.5):
-  blob-SHA drift detects byte-change, not wrongness, so false positives/negatives exist
-  and are lived with. Listed here only so the known gap is on the record.
+- **extensible subjects** — fixed c/a/d/o enum for v1 (§3.3).
+- **"occupant changed" flag for folder notes** — a possible softening of the
+  exact-path-wins rows 13/14 (§2.2); accepted as-is for v1.
+- **hunk-level following** — out, not deferred (§9.5): line ranges rot; whole-file
+  blob identity is the 90% solution. Listed so the known ceiling is on the record.
+- **staleness fidelity** — *not* deferred; settled as an **accepted limitation**
+  (§9.5): blob drift detects byte-change, not wrongness, so false
+  positives/negatives exist and are lived with. Listed here only so the known gap is
+  on the record.

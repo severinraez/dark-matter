@@ -13,7 +13,8 @@ Status legend: `[ ]` open · `[x]` resolved (note resolution inline).
 ## A. Critical — breaks stated invariants or destroys data
 
 ### A1. Orphan hard gate can destroy live knowledge under tree skew
-- [ ] open
+- [x] *(resolved 2026-07-19)* Dissolved by the content-addressable adoption: the hard
+  gate is gone; orphans are a never-destructive worklist (design.md §9.6).
 
 §8.4 defines an orphan as any note-bearing path absent from the *current code working
 tree*, **globally**, and hard-gates until every one is resolved by `mv` or `rm`. But
@@ -34,7 +35,7 @@ what earns the hard gate") — orphans get the hard gate *without* the scoping.
 the orphan check to paths the branch actually touched.
 
 ### A2. Handle minting degenerates under monotonic ULIDs
-- [ ] open
+- [ ] open — tracked as design.md §14 **Q9**
 
 Handles are the first 6 chars of the 80-bit random tail (§2.5), i.e. its top 30 bits.
 Monotonic mode (§7.3) makes same-millisecond ULIDs *increments* of each other — only the
@@ -50,7 +51,9 @@ made it stateful; an extended handle can't be recomputed from the ULID alone). I
 with B5 (where is the handle/id stored?).
 
 ### A3. Same-companion divergence across clones has no merge path
-- [ ] open
+- [x] *(resolved 2026-07-19)* Dissolved by the content-addressable adoption: one store,
+  and `dm sync` is exactly the fix direction below (fetch → CRDT union → push with
+  retry), design.md §8.4.
 
 Two agents on two clones writing `llm/main` (or the same topic companion) is the
 *primary* scenario the CRDT machinery exists for — and the deferred CI end-state (§11)
@@ -65,7 +68,8 @@ from every *reading* clone.
 (fetch → CRDT-merge → commit → push with retry).
 
 ### A4. Alignment check and content-dirt refusal deadlock
-- [ ] open
+- [x] *(resolved 2026-07-19)* Dissolved: no checkout binding, no alignment check, no
+  content-dirt refusal exists — dm serves whatever HEAD it finds (design.md §8.2).
 
 Every `dm` invocation refuses on code-branch/companion mismatch (§8.1); `dm checkout`
 refuses on content dirt; the prescribed remedy is `dm commit` — which is itself an
@@ -80,7 +84,9 @@ HEAD (§7.3), so stamping under mismatch anchors notes to the wrong blobs.
 worktree's checked-out branch, or allow a `--no-stamp` commit as the escape hatch.
 
 ### A5. Within-session drift is silently blessed; the doc's stated defense doesn't hold
-- [ ] open
+- [x] *(resolved 2026-07-19)* Dissolved by construction: anchors are stamped at write
+  time from the working-tree bytes — no `@` placeholder, no commit-time stamping window
+  (design.md §8.3).
 
 A note written at 10:00 describes the file as it was at 10:00; the agent keeps editing;
 `dm commit` at 17:00 stamps the anchor with the **17:00 blob** — asserting freshness
@@ -95,26 +101,31 @@ against the working tree at `k`-time, stamped later at commit time.)
 ## B. Internal contradictions ("design settled" is false in four+ places)
 
 ### B1. Stale-in-ranking, both ways
-- [ ] open
+- [x] *(resolved 2026-07-19)* Settled in the rewrite: staleness flags on read but never
+  reorders in v1 (design.md §5.6, §9.5).
 
 §7.5: "ranking (§4.6) sinks stale below fresh." §4.6: staleness signals "just don't
 reorder for it in v1." Pick one.
 
 ### B2. Feedback in ranking, same disease
-- [ ] open
+- [x] *(resolved 2026-07-19)* Settled in the rewrite: feedback/usage ranking effects are
+  worded as deferred to the weighted scoring function (design.md §7.3, §7.4).
 
 §6.3 says `+` "boosts ranking" and `-` "demotes"; §6.4 says ranking "gains usefulness
 ratio + expansion rate" — all present tense, all contradicted by §4.6/§11's deferral.
 
 ### B3. The `t` tiebreak
-- [ ] open
+- [x] *(resolved 2026-07-19)* The leftover §8.2 text was removed in the rewrite; `t`
+  merges by max timestamp, no tiebreak (design.md §1.3, §7.2).
 
 §1.3: max timestamp, "no tiebreak is needed." §8.2: "orders by wall-clock +
 **replica-id**." §1.3 is right (the register's value *is* the timestamp); §8.2 is
 leftover text.
 
 ### B4. "Per-file merge" is false once `MV` exists
-- [ ] open
+- [x] *(resolved 2026-07-19)* Dissolved: `MV` records and the per-file merge are gone —
+  the store unions per-record and moves are derived at read time (design.md §8.3, §9);
+  the manual `mv` verb's record form is tracked as design.md §14 **Q7**.
 
 §8.2 says the merge "reads both branch versions of each note file, merges each file
 per-region" — but the `MV` redirect map is built from records *across* files and sweeps
@@ -123,7 +134,7 @@ too. The real algorithm is a whole-tree fold with a global redirect pass; header
 migration on move is never specified.
 
 ### B5. What is actually stored in the entry-id field?
-- [ ] open
+- [ ] open — tracked as design.md §14 **Q10**
 
 §7.3's schema says `<entry-id>` (a ULID, 26 chars); the §7.1 example stores `a3f9c1` —
 the 6-char handle, no ellipsis — in both header rows and body records. If files key on
@@ -138,14 +149,15 @@ corruption. Interacts with A2.
 ## C. Underspecified but load-bearing
 
 ### C1. Link storage and reverse lookup
-- [ ] open
+- [ ] open — half-dissolved (one-file-per-record answers "which log"); the remaining
+  back-link/handle index is tracked as design.md §14 **Q11**
 
 §7.3 never says *which file's log* an `LN`/`UL` record is appended to. Back-links are
 "computed on read" and `r:#handle` resolves a handle to its home file — both require
 either a whole-shadow-tree scan per read or an index that appears nowhere in the design.
 
 ### C2. No same-batch backreference for freshly minted handles
-- [ ] open
+- [ ] open — tracked as design.md §14 **Q12**
 
 `a` mints the handle in *output*, so create-then-link — the canonical arch-note gesture,
 per the doc's own agents.md prompt — always costs two round-trips in a design whose
@@ -156,7 +168,7 @@ minting with "an `a` followed by a `u` of the same entry in one batch" — a bat
 **Fix direction:** client-supplied ids, or positional backreferences (`u:$1:...`).
 
 ### C3. No intra-clone concurrency control
-- [ ] open
+- [ ] open — tracked as design.md §14 **Q13**
 
 Two `dm` processes in one clone (parallel agent sessions are the norm now) share a
 replica id and a worktree with zero locking: lost G-counter increments, interleaved
@@ -171,7 +183,8 @@ processes using the same one simultaneously.
 ## D. Strategic / product-level
 
 ### D1. v1 ships unlimited write throughput and defers the entire hygiene loop
-- [ ] open
+- [ ] open — promoted: grows *more* important without the hard gate; tracked as
+  design.md §14 **Q4**
 
 Ranking weights, housekeeping report, compaction, dedup — every mechanism that would
 keep the store healthy is in §11, while the write path is fully armed (including
@@ -180,7 +193,8 @@ alone prevents a slop spiral is the biggest unvalidated premise in the document,
 isn't named as a risk anywhere.
 
 ### D2. Dropping whole-store search kills cold recall
-- [ ] open
+- [ ] open — reopened: the single global store makes it cheap to express; tracked as
+  design.md §14 **Q14**
 
 "What do I know about deploys?" has no verb: `s` needs a path, and `o`/`d` knowledge
 homed on folders is precisely the knowledge you *don't* discover by reading a code file.
@@ -192,11 +206,13 @@ leads with.
 
 ## E. Smaller nits
 
-- [ ] **E1.** §2.3 lists "secrets" as example `o` content — on branches that get pushed
-  and PR'd. Say "where secrets live, never values."
+- [x] **E1.** *(resolved 2026-07-19)* Wording fixed in the rewrite (design.md §3.3:
+  "where secrets live (never values)").
 - [ ] **E2.** C0 rejection in bodies (§3.3) bans tabs, i.e. many pasted code snippets.
 - [ ] **E3.** Paths containing `:` break every non-final field in the grammar
   (`mv:old:new`, `r:path:N` — `r:foo:1` is ambiguous with a file named `foo:1`).
+  Path-valued *record* fields have the sibling problem (spaces); both are folded into
+  design.md §14 **Q6**.
 - [x] **E4.** *(resolved 2026-07-14)* `dm unmerged`'s ✓-detection parsed free-text
   merge-commit subjects. Replaced in design.md §8.5 with purely content-based
   detection: second-parent ancestry (true merge), whole-range `git patch-id` (squash),
