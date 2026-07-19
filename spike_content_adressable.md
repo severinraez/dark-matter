@@ -140,9 +140,17 @@ thing git structurally forgets — what became of rewritten origin lines.
 
 ## 4. Model sketch
 
-- **Store**: one metadata branch (or `refs/dm/*` DAGs, git-bug-style), append-only
-  records, CRDT union merge — the entire §5/§7 record machinery of design.md carries
-  over unchanged (CR/SU/TB/RA/FB/LN/UL, rec-id ULIDs, G-counter headers, handles).
+- **Store**: one metadata branch, `refs/dm/store` — decided 2026-07-19 over
+  git-bug-style per-note operation DAGs: one ref beats thousands (simpler sync,
+  compaction and forge story), at the price of keeping the wall-clock caveat on
+  ULID-ordered LWW folds, mitigable later via Lamport counters in the record
+  headers without changing transport. Append-only records, CRDT union merge — the
+  entire §5/§7 record machinery of design.md carries over unchanged
+  (CR/SU/TB/RA/FB/LN/UL, rec-id ULIDs, G-counter headers, handles). `dm init`
+  configures the `refs/dm/*` fetch refspec; custom refs push/fetch fine through
+  GitHub/GitLab (git-appraise/git-annex precedent), with a plain
+  `refs/heads/dm-store` branch as fallback if a forge misbehaves (forks copy only
+  heads and tags).
 - **Anchors**: file notes → content blob + origin commit, path as display hint (§3).
   Folder notes → path key + origin commit, resolved by the same read-time diff (§6).
 - **Inner loop**: unchanged — `r:` / `s:` / `a` / `u` / `d` / `k` / `f` / `al` / `dl`.
@@ -368,13 +376,9 @@ remainder.
    cost now sits on reads; per-note similarity queries must amortize through the one
    batched origin→checkout diff that file (§8) and folder (§6) resolution share, plus
    the disposable cache (§5 terms).
-3. **Store transport** (§4, §5 terms): single `refs/dm/store` branch with a union
-   merge driver (git-annex-style) vs `refs/dm/*` operation DAGs (git-bug-style) —
-   causal ordering would also retire the wall-clock LWW caveat and the review B-items
-   touching rec-id ordering. Decide.
-4. **Split/absorbed UX** (§0, §6): the agent-facing flow for the folder cases dm
+3. **Split/absorbed UX** (§0, §6): the agent-facing flow for the folder cases dm
    refuses to auto-follow (split) or follows unconfirmed (absorbed).
-5. **Hygiene without a hard gate** (§4, §7): design.md §8.4's gate became an optional
+4. **Hygiene without a hard gate** (§4, §7): design.md §8.4's gate became an optional
    worklist and stale/orphaned are mere classifications — what supplies the forcing
    function (ranking, decay, review cadence)? Review finding D1 grows more important
    under this model (§5 "what the model pays").
