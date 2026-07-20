@@ -226,8 +226,11 @@ case write-time extension cannot see — two replicas concurrently minting the s
 handle for different entries, discovered only at sync — is handled at resolve time: a
 handle that matches several entries errors with the extended candidates
 (`✗ #a3f9c1 ambiguous: #a3f9c1k2 · #a3f9c1p9`), and surfaces display the extended
-forms. (Handle minting under monotonic ULIDs, and what the stored id field actually
-holds, are open — **Q9**/**Q10**, §14.)
+forms. (Resolved 2026-07-20: entry-ids mint with **fresh randomness** — monotonic
+mode is scoped to rec-ids, §8.3 — so tail-prefix handles keep their full entropy;
+and stored records always hold **full entry-id ULIDs**, never handles, so a
+cross-replica handle collision is an ambiguity error, never record corruption —
+Q9/Q10.)
 
 > **Decision:** internal ids are **ULIDs** — globally unique without coordination,
 > lexicographically sortable by creation time (a natural tiebreak), and independent of
@@ -295,6 +298,15 @@ Execution is **two-phase**:
 | `rm`| `rm:path`               | tombstone all entries at path (recursive)|
 | `al`| `al:#a:#b[:note]`       | add link between two entries, opt comment|
 | `dl`| `dl:#a:#b`              | delete a link between two entries        |
+
+> **Decision — same-batch backreference (2026-07-20, resolves Q12).** `$N` refers to
+> the entry created by the batch's **Nth command** (1-based; commands, not physical
+> lines — bodies may span lines via `\`). It is accepted anywhere a `#handle` is
+> (`u`, `d`, `f`, `k`, `al`, `dl`, `r`). `$N` must point to an **earlier** command
+> that is an `a`; a forward, out-of-range, or non-create reference is a phase-1
+> syntax error and rejects the whole batch (§4.1). Acks echo the minted handle
+> (`al:$1:$2` acks `✓ #a3f9c1 → #7c22a1 linked`), so the agent still learns the
+> stable handles from the same output.
 
 ### 4.3 Output format
 One block per command, in input order. Blocks are delimited by **printable sentinel
@@ -423,8 +435,8 @@ OR-group has all its `+`-joined terms present.
 
 > **Decision:** `AND` (`+`) is in for v1, as above. **Whole-store search** (`s::term`
 > across everything, ignoring context scope) was dropped under the companion model;
-> the single global store makes it cheap to express, so it is **reopened as Q14**
-> (§14) rather than settled here. For v1, `s` is context-scoped.
+> the single global store makes it cheap to express, but it is **deferred**
+> (2026-07-20, Q14 → §15). For v1, `s` is context-scoped.
 
 ### 5.6 Ranking
 When more fits than the budget allows, order by **proximity** (closer ancestors first)
@@ -472,8 +484,8 @@ entries:
   comment,
 - `dl:#a:#b` → append an **unlink** (`UL`) record — the pair's current state is LWW.
 Links are never edited inside a body; back-links are the inverse index, computed on
-read (index story: **Q11**, §14) — so a link surfaces identically at both endpoints
-and survives supersede/move/sync.
+read (index: the cache store index, §8.2) — so a link surfaces identically at both
+endpoints and survives supersede/move/sync.
 
 ### 6.5 Manual moves (`mv`) and node removal (`rm`)
 Read-time resolution follows most moves automatically (§9.1–§9.3). `mv:old:new` is
@@ -494,10 +506,10 @@ union like everything else and travel with the store. Reads therefore mutate sta
 the cost is accepted in exchange for stats that can rank *and* are shared. Stat
 deltas accumulate in pending and ride the next `dm sync` (§8.4) — a read-only session
 creates no obligation and loses nothing by not syncing. Explicit feedback rides the
-record log as `FB` records (§7.3). The stats' **physical home in the store is open**
-(**Q6**, §14): the per-record file layout has no mutable header region, so the
-companion-era "stat header per note file" needs a replacement (e.g. per-entry,
-per-replica stat files, which union trivially).
+record log as `FB` records (§7.3). The stats' physical home is **one stats file per
+replica** in the store tree (`stats/<replica-id>` — resolved 2026-07-20, Q6, §8.1):
+each replica writes only its own file, so union is conflict-free and
+max-per-replica is trivial.
 
 ### 7.1 What's tracked (per logical entry)
 | stat                 | signal                                                  |
@@ -526,7 +538,7 @@ double-count on sync.
 > different events.
 
 ### 7.2 Merge semantics
-- One stat row per logical entry, keyed by id.
+- One stat row per logical entry, keyed by full entry-id ULID (§8.3).
 - Each counter (`i`, `x`, `h`) is a **G-Counter**: `A3:12,F2:4` = replica A3→12,
   F2→4, total 16. Missing field = zero. Merge = union replicas, **max per replica**,
   sum for value.
@@ -534,7 +546,11 @@ double-count on sync.
 - Feedback tallies are **not** counters — they fold from `FB` records (§7.3), which
   is what lets a dispute be cleared (a G-Counter could only ever grow).
 
-These semantics are settled regardless of where the rows physically live (**Q6**).
+Physically, the rows live in per-replica stats files (§8.1): one row per entry
+inside `stats/<replica-id>`. The two operations act on different axes — **max**
+reconciles two *copies of the same replica's file* (cells are monotonic, so a stale
+snapshot never double-counts); **sum** aggregates cells *across* replica files to
+display the value. Replica A at 2 and replica B at 3 always total 5.
 
 ### 7.3 Feedback interface (`f`)
 ```
@@ -588,8 +604,7 @@ memoized query result (verdicts, §9.4) or a disposable cache.
 
 - **Append-only records**, one ULID-named file per record, merged by **CRDT union**:
   distinct filenames never collide, identical records dedup — a sync can never
-  conflict. (Exact file grouping and the stats' home ride **Q6**, §14; the union
-  semantics are settled.)
+  conflict. (Physical layout: the decision block below.)
 - The store's commit tree also carries the **anchored blobs**, keeping described
   content fetchable forever (no reflog dependence). Git dedups blobs that any commit
   already contains, so the overhead is only truly uncommitted content that was
@@ -598,6 +613,34 @@ memoized query result (verdicts, §9.4) or a disposable cache.
   through GitHub/GitLab (git-appraise / git-annex precedent); a plain
   `refs/heads/dm-store` branch is the fallback if a forge misbehaves (forks copy only
   heads and tags).
+
+> **Decision — store tree layout (2026-07-20, resolves Q6).** Three top-level dirs:
+>
+> ```
+> records/<t4>/<rec-id>    # one file per record, sharded by the rec-id's first
+>                          # 4 chars (≈12-day ULID-time windows)
+> stats/<replica-id>       # one file per replica: "<entry-id> i:<n> x:<n> h:<n> t:<ms>" rows
+> blobs/<2ch>/<38ch>       # anchored blobs, content-addressed like git's odb
+> ```
+>
+> - **Records** shard by time prefix so tree objects stay small and old shards
+>   *freeze* — stable trees delta and pack well, where a flat dir would rewrite one
+>   giant tree object every sync. Self-contained: the shard is derived from the id.
+> - **Stats** — one file per replica, one row per entry that has stats; each replica
+>   writes **only its own file**. Merging two copies of the same replica's file is
+>   field-wise **max**; the displayed value **sums** across replica files (§7.2).
+>   Chosen over per-entry-per-replica files (entries × replicas file explosion) and
+>   over stat-increment records (every impression would append forever — the
+>   register file *is* the compacted form). Cadence: deltas accumulate in
+>   `.git/.dm/pending/stats` under the Q13 lock; `dm sync` folds them in (add
+>   counters, max `t`); reads merge store + pending accumulator.
+> - **Blobs** — at `a`/`u`/`k` time, an anchored blob the odb doesn't already have
+>   (truly uncommitted content) is staged to `.git/.dm/pending/blobs/<sha>` —
+>   deliberately *not* `git hash-object -w`, since a loose unreferenced object can
+>   be GC'd before the next sync. Sync writes it into the store tree, after which
+>   store commits keep it reachable forever. A record's `<anchor>` field is the blob
+>   SHA, so record → blob is a direct address; blob → entries is the store index
+>   (§8.2).
 
 ### 8.2 Clone-local state — `.git/.dm/`
 - `.git/.dm/replica` — the per-clone replica id + config (§8.5).
@@ -609,11 +652,47 @@ memoized query result (verdicts, §9.4) or a disposable cache.
   answer on any clone, so there is no resolved-state to replicate, corrupt, or
   migrate.
 
+> **Decision — cache mechanism (2026-07-20, resolves Q11).** Content-keyed,
+> **immutable** cache files, stdlib-only — no embedded database: the cache is
+> write-once/read-many (rebuilt wholesale, never mutated in place), which is exactly
+> the case where a KV store's transactional mutation buys nothing. The **store
+> index** (`index-<store-tip>`) memoizes the store-wide maps every read needs:
+> entry-ids sorted by random tail (handle → entry by prefix range), entry-id → its
+> record files, link source/target → `LN`/`UL` records, and anchor lookups
+> (blob-sha → entries, path-hint → entries). The filename is the key, so **presence
+> = validity** — no invalidation logic: the tip only moves at `dm sync` (which
+> rebuilds eagerly as its last step), a read finding no matching file rebuilds with
+> one full scan, and non-matching files are GC'd opportunistically. Files are built
+> in a temp file and renamed into place: atomic, and race-safe without locks —
+> concurrent rebuilds produce byte-identical content, so last-rename-wins is
+> harmless (Q13 concerns pending only). A versioned header (magic + format version)
+> guards format changes; any mismatch or parse error → delete and rebuild. Format:
+> length-prefixed binary (`encoding/binary`; the fields are mostly fixed-width
+> ULIDs/SHAs), loaded wholesale into maps per invocation — ~1–2 MB at 10k entries,
+> single-digit milliseconds, amortized across the batch. **Pending is never
+> indexed**: it is scanned linearly, per-session small by construction. Similarity
+> memos follow the same pattern (`match-<origin>-<checkout-tree>`). Pre-paid upgrade
+> paths if Q2 profiling demands them: mmap'd sorted fixed-width arrays (git
+> pack-`.idx` style) and incremental chaining from the prior index (the store is
+> append-only under union merge, so a new tip's record set is a superset).
+
 Living inside the git dir means git never walks into it from any working tree, it is
 invisible to `git status` with no exclude entry, and it is per-clone, shared across
 all code worktrees. There is no checkout binding and nothing to keep aligned — `dm`
-serves whatever HEAD and working tree it finds. (Locking between concurrent `dm`
-processes in one clone: **Q13**, §14.)
+serves whatever HEAD and working tree it finds.
+
+> **Decision — intra-clone locking (2026-07-20, resolves Q13).** One advisory
+> exclusive lock, `.git/.dm/lock`, taken **for the duration of every invocation** —
+> reads write too (stat deltas, verdicts), so a shared/read mode isn't worth having.
+> `flock(2)`-style locking (`LockFileEx` on Windows), not an `O_EXCL` sentinel file:
+> the lock dies with the process, so a crash can never leave the git-`index.lock`
+> stale-lock failure mode. Contenders **block** briefly (batches run in
+> milliseconds), then error: `✗ another dm process holds .git/.dm/lock (pid N)`. The
+> lock also restores cross-process rec-id order: on acquisition, monotonic minting
+> resumes from the largest rec-id already in pending when the clock hasn't advanced
+> past it, so two serialized same-millisecond processes can never fold out of order.
+> Nothing else needs locking: the cache is race-safe by construction (above), and
+> the store merges by union (§8.4).
 
 ### 8.3 Record schema
 Every record's first two fields are its **type** and its **record-id**; the rest are
@@ -626,10 +705,19 @@ type-specific, body last:
   re-stamps the anchors.
 - `TB <rec-id> <entry-id>` — tombstone.
 - `RA <rec-id> <entry-id> <anchor> <origin> <path>` — re-anchor only (§9.5), no body.
-- `LN <rec-id> <from-#> <to-#> [comment]` — link, with optional comment.
-- `UL <rec-id> <from-#> <to-#>` — unlink.
+- `LN <rec-id> <from-id> <to-id> [comment]` — link, with optional comment.
+- `UL <rec-id> <from-id> <to-id>` — unlink.
 - `FB <rec-id> <entry-id> <sig> [reason]` — feedback: `sig` ∈ `+`/`-`/`!`, optional
   free-text reason (body-last rule as usual, §7.3).
+- `VD <rec-id> <origin-commit> <verdict> [<landed-as>]` — memoized rule-(b) verdict
+  (§9.4): `landed <commit>` or `abandoned`; fold rule in §9.4.
+
+> **Decision — id fields hold full ULIDs (2026-07-20, resolves Q10).** Every
+> id-valued field above (`<entry-id>`, `<from-id>`, `<to-id>`) holds the **full
+> 26-char entry-id ULID**, and stat rows key on the same (§7.2). Handles never
+> appear in stored records: they are a surface affordance, resolved to entry-ids at
+> parse time against the visible set (§5.3). A cross-replica handle collision is
+> therefore an input-ambiguity error (§3.5), never record interleaving.
 
 There is **no `MV` record type**: the companion model's redirect-map machinery is
 gone — moves are *derived* at read time (§9.1–§9.3), and the manual `mv` verb's
@@ -641,9 +729,12 @@ record form is open (**Q7**, §14).
 > same "body is the trailing field" rule as stdin (§4.1). Therefore `:`, spaces, and
 > backticks inside a body need **no escaping**. Multi-line bodies use the same
 > trailing-`\` continuation as stdin; the only escape is a literal trailing
-> backslash, doubled `\\`. **Caveat:** path-valued fixed fields (`<path>`, folder
-> anchors) can contain spaces and need an encoding that survives the space-split —
-> settled together with the physical layout under **Q6** (and review nit E3).
+> backslash, doubled `\\`. **Path fields (2026-07-20, resolves Q6's encoding half /
+> review nit E3):** path-valued fixed fields (`<path>`, folder anchors) are
+> **canonically percent-encoded** — exactly `%` → `%25`, space → `%20`, and C0
+> bytes → `%XX`; every other byte raw. Canonical (always this set, never more) is
+> load-bearing: union dedup is byte-identity, so any path must have exactly one
+> encoding. Bodies are untouched (body-last).
 
 **Decision — record identity & ordering.** `<rec-id>` is a **ULID minted per record**
 (distinct from `<entry-id>`, the logical entry's ULID). One field does three jobs:
@@ -659,11 +750,15 @@ record form is open (**Q7**, §14).
 
 Two refinements make the order trustworthy:
 
-- **Monotonic minting.** `dm` mints ULIDs in the spec's *monotonic mode* per process:
-  within the same millisecond, each successive id increments the previous random tail
-  instead of re-rolling it. This guarantees a batch's records order as written — an
-  `a` followed by a `u` of the same entry in one batch can never fold backwards.
-  (Interaction with handle entropy: **Q9**; same-batch backreference: **Q12**, §14.)
+- **Monotonic minting — rec-ids only (2026-07-20, resolves Q9).** `dm` mints
+  **rec-ids** in the spec's *monotonic mode* per process: within the same
+  millisecond, each successive id increments the previous random tail instead of
+  re-rolling it. This guarantees a batch's records order as written — an `a`
+  followed by a `u` of the same entry in one batch can never fold backwards.
+  **Entry-ids are exempt**: they mint with fresh randomness per id — monotonicity is
+  only needed where ordering is load-bearing, and entry-ids play no ordering role —
+  so same-millisecond entries share no tail prefix and the §3.5 handle derivation
+  keeps its full 30 bits. (Same-batch backreference: resolved via `$N` — §4.2.)
 - **Clock skew — accepted.** rec-id order is wall-clock order, so a clone with a fast
   clock wins concurrent LWW resolutions until its skew is corrected. Accepted for v1
   and on the record here: resolution stays deterministic and nothing is destroyed —
@@ -766,6 +861,52 @@ chars from a CSPRNG at `dm init`) so collisions never need coordinating.
 > the max-per-replica merge (§7.2). A copied clone must delete `.git/.dm/replica` (or
 > re-run `dm init`) so a fresh id is minted. (Test fixtures copy clones deliberately,
 > with pinned replica ids — §11.2.)
+
+### 8.6 Worked example — one note, write to read
+
+On `main` at HEAD `41c09d7`, the working tree contains `api/handler.rb` whose bytes
+hash to blob `9f4e2ab`. The agent runs:
+
+```
+a:api/handler.rb:c:Validates tenant header before dispatch
+```
+
+**Write.** Under the invocation lock, `a` stamps both anchors (blob `9f4e2ab` via
+`hash-object`, bytes staged to `pending/blobs/` only if the odb lacks them; origin
+`41c09d7` = HEAD), mints entry-id `01K0N3AB4XA3F9C1TQ84MZV2R7` (fresh random tail →
+handle `#a3f9c1`) and rec-id `01K0N3AB4X8QF3ZJ4WT2P9K6H1` (monotonic), and appends
+exactly one file, `.git/.dm/pending/records/01K0N3AB4X8QF3ZJ4WT2P9K6H1`:
+
+```
+CR 01K0N3AB4X8QF3ZJ4WT2P9K6H1 01K0N3AB4XA3F9C1TQ84MZV2R7 c 9f4e2ab 41c09d7 api/handler.rb Validates tenant header before dispatch
+```
+
+Ack: `+ #a3f9c1 created`. No store commit, no ref touched, no stat row. Every field
+has exactly one later consumer: rec-id → fold/LWW order · entry-id → identity
+(handle, links, stats key) · subj → ranking/display · anchor → rule (a) · origin →
+rule (b) · path → display + resolution hint · body → what `r` shows. A later
+`dm sync` moves the record to `records/01K0/…K6H1`, any staged blob to
+`blobs/9f/…`, and rebuilds the index for the new tip.
+
+**Read** — `r:api/handler.rb`, any clone, before or after sync (reads see store ∪
+pending). Load the tip's index and scan pending; hash the working file → `9f4e2ab`
+→ blob-sha→entries map → this entry (path-hint lookups on the ancestors surface
+folder/arch notes). Rule (a): anchored blob present at the hint path → fresh. Rule
+(b): `41c09d7` is an ancestor of HEAD → visible. Fold entry-id→records
+(`[CR …K6H1]`) → rev 1, that body and anchor current, no dispute. Assemble the
+surface and count the impression (`i+1` in `pending/stats`):
+
+```
+▸r:api/handler.rb
+c #a3f9c1 Validates tenant header before dispatch
+context: 1 own · 0 parent · 0 links
+◾1 ok
+```
+
+A follow-up `r:#a3f9c1` binary-searches the tail-sorted entry array for prefix
+`A3F9C1`, returns the full body + links one level, and counts the click (`x+1`,
+`t=now`). The five states are never stored — rules (a)/(b) recompute them on every
+read.
 
 ---
 
@@ -892,7 +1033,10 @@ abandoned (verdict appended on first computation).
 rewritten origin lines: **landed** (origin O landed as commit M — squash/rebase,
 matched by patch-id / tree containment) or **abandoned** (origin unreachable from
 all refs, unlanded). Appended lazily by whichever clone first computes the answer;
-union-synced, so every replica inherits it.
+union-synced, so every replica inherits it. Record form: `VD` (§8.3). If one origin
+accumulates conflicting verdicts, **landed beats abandoned** — landed is positive
+patch-id evidence, abandoned is absence of evidence (exactly the wrong-abandoned
+case below) — then largest rec-id among landed.
 
 **Verdict correction**: wrong verdicts are repaired at the note level in v1, with
 verbs that already exist. Wrong *abandoned* (notes wrongly worklisted — e.g. the
@@ -1033,7 +1177,8 @@ concise.
 > stable — copy them into later commands.
 >
 > **Batch over stdin**, one command per line, body always last (`:` in a body needs
-> no escaping; trailing `\` continues to the next line):
+> no escaping; trailing `\` continues to the next line; `$N` references the entry
+> created by command N of the same batch, so create-then-link is one round trip):
 > ```
 > dm <<EOF
 > r:api/handler.rb
@@ -1108,15 +1253,18 @@ to snapshot sync results; devs use it to inspect what actually landed.
 - **Discovery** — surface previews, cost hints, drill-by-handle, depth modifier,
   search.
 - **Two-phase** — syntactically bad batch writes nothing; per-command errors
-  isolated.
+  isolated; `$N` backref violations (forward / out-of-range / non-create) reject
+  at parse.
 - **Visibility** — replay the §2 file and folder tables **row by row**; the tables
   are the acceptance spec.
 - **Resolution** — rename bands (§9.2), folder follow heuristic and edge cases
   (§9.3), ambiguity policy, path-hint preference.
-- **Verdicts** — squash and rebase landings, abandoned branches, wrong-verdict
-  repair (§9.4).
+- **Verdicts** — squash and rebase landings, abandoned branches, the
+  landed-beats-abandoned fold, wrong-verdict repair (§9.4).
 - **Sync** — two replicas, union convergence, non-ff retry, stat counter merge
   (G-Counters sum across replicas; LWW `t` picks the max).
+- **Locking** — concurrent invocations serialize on `.git/.dm/lock`; rec-id order
+  survives a same-millisecond process handoff (Q13, §8.2).
 - **Determinism** — same records, different sync orders/replicas → identical folded
   state.
 - **Guard** — the fixture build commands (`a`, seed path) produce the expected base.
@@ -1200,12 +1348,13 @@ Carried from the spike (validation gates — run before/while building v1):
 
 From adopting the architecture (surfaced in the 2026-07-19 comparison):
 
-- **Q6 — physical store layout for stats (and path fields).** The
-  one-file-per-record store has no mutable region for the G-Counter/`t` stat rows
-  (§7.2); a layout is needed (candidate: per-entry, per-replica stat files — each
-  replica writes only its own, so union is conflict-free and max-per-replica is
-  trivial). The same decision covers the encoding of path-valued fixed fields in
-  records (§8.3, review nit E3) and the stat-sync cadence.
+- **Q6 — physical store layout. Resolved 2026-07-20:** store tree =
+  `records/<t4>/<rec-id>` (time-sharded) · `stats/<replica-id>` (one file per
+  replica; field-wise max between copies of one replica's file, sum across
+  replicas) · `blobs/<sha>` (content-addressed; uncommitted bytes stage in
+  pending, never loose in the odb); path-valued fixed fields canonically
+  percent-encoded (`%`, space, C0); stat cadence = pending accumulator folded at
+  sync; verdict record `VD` added to the schema (§8.1, §8.3, §9.4).
 - **Q7 — record form of manual `mv`/`rm`.** The companion model's `MV`
   redirect-map/fixpoint machinery is gone; `mv` survives as the manual-residue verb
   (§6.5). What it appends — per-entry re-anchor (`RA` with new path) vs. a
@@ -1214,33 +1363,36 @@ From adopting the architecture (surfaced in the 2026-07-19 comparison):
   live companion branches") no longer exists. When may superseded revisions,
   tombstoned entries, stale verdicts, and no-longer-referenced anchored blobs be
   dropped from the single store, without losing concurrent increments or breaking
-  row-14 convergence (§8.4)?
+  row-14 convergence (§8.4)? Note (2026-07-20): the store's *history* carries no
+  information — records are self-timestamped, only the tip tree is data — so
+  compaction can plausibly be an orphan re-commit of the tip tree; the open part is
+  the coordination/safety condition.
 
 Carried from the review (apply to both architectures — [review.md](review.md)):
 
-- **Q9 (A2) — handle minting degenerates under monotonic ULIDs.** Same-millisecond
-  ids differ only in their lowest bits, so 6-char random-tail prefixes collide by
-  construction within a batch. Likely fix: mint handles from their own randomness —
-  conceding the handle is stored state, not derived. Interacts with Q10.
-- **Q10 (B5) — what the stored id field holds.** Full ULID vs. handle in records and
-  stat rows: full ULIDs make ambiguity resolution work but the doc's examples show
-  handles; keying on handles turns a cross-replica handle collision into record
-  interleaving — corruption, not ambiguity. Must be pinned.
-- **Q11 (C1, residue) — back-link / handle-resolution index.** One-file-per-record
-  answers "which log does `LN` live in," but `r:#handle` and `← linked-from` still
-  need either a full-store scan per read or an index (cacheable, §8.2) that is not
-  yet specified.
-- **Q12 (C2) — same-batch backreference.** `a` mints the handle in *output*, so
-  create-then-link costs two round-trips in a design built to amortize round-trips.
-  Fix direction: client-supplied ids or positional backreferences (`al:$1:#b`).
-- **Q13 (C3) — intra-clone concurrency.** Two `dm` processes in one clone share a
-  replica id and pending dir with no locking: lost counter increments, interleaved
-  writes, per-process monotonic minting that isn't monotonic across processes. A
-  lockfile in `.git/.dm/` at minimum.
-- **Q14 (D2) — whole-store search.** "What do I know about deploys?" has no verb:
-  `s` needs a path, and `o`/`d` knowledge homed on folders is exactly what you don't
-  discover by reading a code file. Dropped under the companion model; the single
-  global store makes it cheap to express — revisit rather than drop (§5.5).
+- **Q9 (A2) — handle minting under monotonic ULIDs. Resolved 2026-07-20:**
+  monotonic minting is scoped to rec-ids, where ordering is load-bearing; entry-ids
+  mint with fresh randomness per id, so tail-prefix handles keep their full entropy
+  and stay derived, not stored (§3.5, §8.3).
+- **Q10 (B5) — what the stored id field holds. Resolved 2026-07-20:** records
+  (including `LN`/`UL`/`FB`) and stat rows hold **full entry-id ULIDs**; handles
+  never appear in stored records — they are surface-only, resolved at parse time
+  against the visible set (§8.3). A cross-replica handle collision is therefore an
+  ambiguity error, never record interleaving.
+- **Q11 (C1) — back-link / handle-resolution index. Resolved 2026-07-20:** a
+  derived store index in the cache — a content-keyed immutable file
+  (`index-<store-tip>`, atomic rename, versioned header, wholesale load, stdlib
+  binary format, no embedded database); pending is scanned linearly (§8.2).
+- **Q12 (C2) — same-batch backreference. Resolved 2026-07-20:** positional `$N`
+  backrefs — `$N` = the entry created by the batch's Nth command, valid wherever a
+  handle is, parse-rejected unless it points at an earlier `a` (§4.2).
+- **Q13 (C3) — intra-clone concurrency. Resolved 2026-07-20:** one advisory
+  exclusive `flock` on `.git/.dm/lock`, held for every invocation's duration; blocks
+  briefly, then errors; auto-released on process death; minting resumes from the
+  largest pending rec-id so serialized same-ms processes stay rec-id-ordered (§8.2).
+- **Q14 (D2) — whole-store search. Resolved 2026-07-20: deferred** (§15) — v1 `s`
+  stays context-scoped (§5.5); the single global store keeps `s::term` cheap to add
+  once the need is demonstrated.
 
 ---
 
@@ -1262,6 +1414,9 @@ Carried from the review (apply to both architectures — [review.md](review.md))
 - **team-shared vs per-clone stats** — already merged via CRDT counters; revisit if
   per-clone granularity turns out to matter.
 - **duplicate signal** — none for v1; agent cleans up via CRUD (§6.3).
+- **whole-store search** (`s::term`, Q14) — "what do I know about deploys?" has no
+  verb in v1; `s` stays context-scoped (§5.5). The single global store makes it
+  cheap to add when the need is demonstrated.
 - **oversized-entry pagination** — expansion returns full body for v1; paginate huge
   entries later with a continuation handle.
 - **extensible subjects** — fixed c/a/d/o enum for v1 (§3.3).
