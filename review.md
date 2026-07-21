@@ -226,12 +226,15 @@ leads with.
 - [x] **E1.** *(resolved 2026-07-19)* Wording fixed in the rewrite (design.md §3.3:
   "where secrets live (never values)").
 - [ ] **E2.** C0 rejection in bodies (§3.3) bans tabs, i.e. many pasted code snippets.
-- [ ] **E3.** Paths containing `:` break every non-final field in the grammar
-  (`mv:old:new`, `r:path:N` — `r:foo:1` is ambiguous with a file named `foo:1`).
-  Path-valued *record* fields have the sibling problem (spaces); both were folded
-  into **Q6**. *(2026-07-20: the record half is resolved — canonical
-  percent-encoding, design.md §8.3. The grammar half — `:` inside a non-final CLI
-  path field — remains open.)*
+- [x] **E3.** *(resolved)* Paths containing `:` break every non-final field in the
+  grammar (`mv:old:new`, `r:path:N` — `r:foo:1` is ambiguous with a file named
+  `foo:1`). Path-valued *record* fields have the sibling problem (spaces); both were
+  folded into **Q6**. *(2026-07-20: record half — canonical percent-encoding,
+  design.md §8.3. 2026-07-21: grammar half — CLI path fields are percent-decoded
+  after positional splitting; `:` → `%3A` joins the canonical set; strict decode
+  rejects bad escapes at phase 1 with a hint; `dm` output always prints the canon,
+  so output round-trips as input; examples switched to quoted `<<'EOF'` heredocs.
+  design.md §4.1/§8.3.)*
 - [x] **E4.** *(resolved 2026-07-14)* `dm unmerged`'s ✓-detection parsed free-text
   merge-commit subjects. Replaced in design.md §8.5 with purely content-based
   detection: second-parent ancestry (true merge), whole-range `git patch-id` (squash),

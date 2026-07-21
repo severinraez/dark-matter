@@ -255,7 +255,7 @@ Q9/Q10.)
 `dm` reads commands from stdin, one per line, `cmd:...` form, to amortize token cost:
 
 ```
-dm <<EOF
+dm <<'EOF'
 r:file1.rb
 r:test/file2.rb
 a:test/file3.rb:c:some notes about file3.rb
@@ -285,6 +285,27 @@ Execution is **two-phase**:
 > the body may span multiple physical lines. The **only** escaped character is the
 > line separator that divides commands: a body newline is written as a trailing `\`
 > continuation, so a command runs until the first line **not** ending in `\`.
+>
+> **Decision — path-field escaping (2026-07-21, resolves review nit E3's grammar
+> half).** Splitting is unchanged: fields split left-to-right on raw `:`, final
+> field greedy. After splitting, every **path-valued field** is **percent-decoded**;
+> all other fields (bodies, reasons, link notes, search terms, handles, subjects)
+> are never decoded. Input needs exactly two escapes: a literal `%` in a path is
+> always written `%25`, and a `:` inside a path is written `%3A`. Decoding is
+> **strict** — a `%` not followed by two hex digits is a phase-1 syntax error whose
+> message carries the hint (`":" in a path? write %3A · literal "%"? write %25`) —
+> so a forgotten escape fails loudly instead of naming the wrong file. This makes
+> optional trailing fields deterministic: `r:foo:1` is a depth-1 read of `foo`; the
+> file literally named `foo:1` is `r:foo%3A1` — after the mandatory fields, a raw
+> colon can only be a field separator. (A raw `:` happens to survive in a *final*
+> path field — greedy — but canonical output never relies on that.) `dm` prints
+> every path in the full canonical encoding (`%` `:` space C0 — one canon shared
+> with record fields, §8.3), so any path copied from `dm` output is already valid
+> input. The agents.md prompt carries **no escaping hint**: the rule fires only on
+> pathological paths, and the phase-1 error teaches it exactly when needed.
+> Heredoc form: all examples use `dm <<'EOF'` (quoted) — an unquoted heredoc lets
+> the shell swallow trailing `\`-newlines (gluing body lines together) and expand
+> `$N` backreferences before `dm` ever sees them.
 
 ### 4.2 Command grammar
 
@@ -764,10 +785,13 @@ are write-time macros over `RA`/`TB` (decision in §6.5, resolves Q7).
 > trailing-`\` continuation as stdin; the only escape is a literal trailing
 > backslash, doubled `\\`. **Path fields (2026-07-20, resolves Q6's encoding half /
 > review nit E3):** path-valued fixed fields (`<path>`, folder anchors) are
-> **canonically percent-encoded** — exactly `%` → `%25`, space → `%20`, and C0
-> bytes → `%XX`; every other byte raw. Canonical (always this set, never more) is
-> load-bearing: union dedup is byte-identity, so any path must have exactly one
-> encoding. Bodies are untouched (body-last).
+> **canonically percent-encoded** — exactly `%` → `%25`, `:` → `%3A`, space →
+> `%20`, and C0 bytes → `%XX`; every other byte raw. (`%3A` joined the set
+> 2026-07-21 with E3's grammar half: records themselves never split on `:`, but
+> this is the one canon shared by record fields, CLI path fields, and all `dm`
+> output — §4.1.) Canonical (always this set, never more) is load-bearing: union
+> dedup is byte-identity, so any path must have exactly one encoding. Bodies are
+> untouched (body-last).
 
 **Decision — record identity & ordering.** `<rec-id>` is a **ULID minted per record**
 (distinct from `<entry-id>`, the logical entry's ULID). One field does three jobs:
@@ -1340,7 +1364,7 @@ concise.
 > no escaping; trailing `\` continues to the next line; `$N` references the entry
 > created by command N of the same batch, so create-then-link is one round trip):
 > ```
-> dm <<EOF
+> dm <<'EOF'
 > r:api/handler.rb
 > a:api/handler.rb:c:Validates tenant header before dispatch
 > EOF
@@ -1416,6 +1440,11 @@ to snapshot sync results; devs use it to inspect what actually landed.
 - **Two-phase** — syntactically bad batch writes nothing; per-command errors
   isolated; `$N` backref violations (forward / out-of-range / non-create) reject
   at parse.
+- **Path escaping** (E3) — `r:foo%3A1` reads the file named `foo:1` while
+  `r:foo:1` is a depth-1 read of `foo`; a bare `%` in a path rejects at phase 1
+  with the `%25`/`%3A` hint; a body line ending `\\` ends the command with a
+  literal backslash while `\` continues it; every path `dm` prints re-parses as
+  valid input (canonical round-trip, §4.1/§8.3).
 - **Visibility** — replay the §2 file and folder tables **row by row**; the tables
   are the acceptance spec.
 - **Resolution** — rename bands (§9.2), folder follow heuristic and edge cases
