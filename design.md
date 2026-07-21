@@ -350,7 +350,21 @@ characters:
 > ~1 token each. Unambiguity is enforced at the write end instead: `dm` **rejects `▸`
 > and `◾` in note bodies** (`✗` error) — they are pure decoration characters with no
 > plausible use in a note — so a body line can never be mistaken for a boundary. (C0
-> control bytes are rejected in bodies too, keeping output shell-safe.)
+> control bytes are rejected in bodies too, keeping output shell-safe — **except
+> tab**, see the amendment.)
+>
+> **Amendment — tab is whitelisted (2026-07-21, resolves review nit E2).** Tab is
+> the one C0 byte that is ordinary text: Makefiles require it, gofmt'd Go is
+> tab-indented, and pasted snippets are exactly what a `d` note holds — the blanket
+> ban collided with the tool's own pitch. Every channel the framing decision worries
+> about passes tab untouched, and tab breaks neither the grammar nor the records
+> (bodies are the final field, never split). So bodies reject **C0 except tab**;
+> newline already has its `\` representation (§4.1). The genuinely channel-hostile
+> bytes (NUL, escape, RS/GS, …) stay banned — they have no plausible use in a note.
+> Tab in *path* fields still percent-encodes as C0 (§8.3). Silent tab→space
+> conversion was rejected: it would corrupt the pasted snippet (a Makefile line
+> copied back out would be syntactically wrong), against the
+> never-silently-altered principle.
 
 ```
 ▸r:api/handler.rb
@@ -1399,10 +1413,21 @@ the resulting store state. This is the primary test strategy.
 > must mutate `refs/dm/store` and branch refs independently. Copying a clone
 > duplicates the replica id (§8.5's caveat) — deliberate and harmless here, since
 > fixture replica ids are pinned anyway.
+>
+> **Decision — the builder lives in the test harness, not the binary (2026-07-21,
+> resolves review nit E5).** The fixture is built by a **harness-owned tool**
+> (`cmd/dm-fixture`, built from the same module, never shipped) from a single
+> declarative manifest — code history + notes + seeded stats — so a storage-format
+> change is still absorbed in one place. The builder needs no internal hooks: it
+> drives the public `dm` stdin interface (`a` etc.) plus plain git, per the guard
+> paragraph below. What *does* remain in the production binary are the
+> **determinism overrides** the E2E tests need in order to drive the real shipped
+> artifact — injectable clock, seeded id source, pinned replica id, as env-var
+> overrides — accepted explicitly as inert, debug-useful residue (the replica id
+> is real configuration anyway, §8.5). There is no `dm fixture` subcommand; the
+> §10.1 surface is unchanged.
 
-The fixture is **built by a command** (`dm fixture build`) from a single declarative
-manifest — code history + notes + seeded stats — so a storage-format change is
-absorbed in one place. It exercises every disclosure dimension: a file with
+The fixture exercises every disclosure dimension: a file with
 mixed-subject own notes; a nested folder tree (≥2 ancestor levels); an architecture
 note at an LCA folder linking members (back-links); an entry with pre-seeded stats
 (ranking + `⚠disputed`); a superseded entry (rev ≥2) and a tombstoned one; a
@@ -1445,6 +1470,9 @@ to snapshot sync results; devs use it to inspect what actually landed.
   with the `%25`/`%3A` hint; a body line ending `\\` ends the command with a
   literal backslash while `\` continues it; every path `dm` prints re-parses as
   valid input (canonical round-trip, §4.1/§8.3).
+- **Body bytes** (E2) — a tab-bearing body (Makefile/gofmt snippet) round-trips
+  byte-identically through write, store, and surface; NUL and the other C0 bytes,
+  and `▸`/`◾`, still reject with `✗` (§4.3).
 - **Visibility** — replay the §2 file and folder tables **row by row**; the tables
   are the acceptance spec.
 - **Resolution** — rename bands (§9.2), folder follow heuristic and edge cases
@@ -1504,7 +1532,7 @@ plus a hard `dm pre-commit` gate forcing orphan/staleness reconciliation before
 every shadow commit, and patch-id detection to recognize branches landed by hosted
 rebase/squash buttons.
 
-**Why it was rejected.** Adversarial review ([review.md](review.md)) found the
+**Why it was rejected.** Adversarial review ([review.md](archive/review.md)) found the
 storage core sound but produced four critical findings — **A1** (the orphan hard
 gate destroys live knowledge under tree skew), **A3** (same-companion divergence
 across clones has no merge path), **A4** (alignment-check/content-dirt deadlock),

@@ -225,7 +225,9 @@ leads with.
 
 - [x] **E1.** *(resolved 2026-07-19)* Wording fixed in the rewrite (design.md §3.3:
   "where secrets live (never values)").
-- [ ] **E2.** C0 rejection in bodies (§3.3) bans tabs, i.e. many pasted code snippets.
+- [x] **E2.** *(resolved 2026-07-21)* C0 rejection in bodies bans tabs, i.e. many
+  pasted code snippets. Tab is now whitelisted — bodies reject C0 *except* tab;
+  the channel-hostile bytes stay banned (design.md §4.3).
 - [x] **E3.** *(resolved)* Paths containing `:` break every non-final field in the
   grammar (`mv:old:new`, `r:path:N` — `r:foo:1` is ambiguous with a file named
   `foo:1`). Path-valued *record* fields have the sibling problem (spaces); both were
@@ -241,8 +243,11 @@ leads with.
   `git cherry` (rebase). Remaining edge cases documented there as accepted: diff
   modified in flight, empty range, deleted local ref (all → `?`), and patch-id
   coincidence (the one false-`✓`, argued harmless via idempotent union).
-- [ ] **E5.** `dm fixture build` (§9.2) ships a test-fixture subcommand in the
-  production binary.
+- [x] **E5.** *(resolved 2026-07-21)* `dm fixture build` ships a test-fixture
+  subcommand in the production binary. The builder moved to a harness-owned tool
+  (`cmd/dm-fixture`, never shipped) driving the public stdin interface; only the
+  determinism env overrides remain in the binary, accepted explicitly
+  (design.md §11.2).
 
 ---
 

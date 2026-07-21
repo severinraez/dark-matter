@@ -3,7 +3,7 @@
 Survey of how existing systems store metadata beside code and/or track what a git
 repository is doing. Collected during the git-workflow discussion of 2026-07-14;
 referenced from [spike_content_adressable.md](spike_content_adressable.md) §2.
-Findings referenced as A3/A4 are in [review.md](review.md).
+Findings referenced as A3/A4 are in [review.md](archive/review.md).
 
 ## Metadata-beside-code systems
 
