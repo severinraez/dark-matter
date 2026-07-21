@@ -3,7 +3,7 @@
 > **Status:** architecture settled — the **content-addressable model**
 > (content + origin anchors, one shared store, visibility computed per read) is
 > normative (§2–§12, decisions as blocks in their sections); the
-> companion-branch model is rejected (§13). Remaining work is empirical — two
+> companion-branch model is rejected (§13). Remaining work is empirical — three
 > build-time validation gates (§14); deferred scope is §15.
 
 ---
@@ -46,8 +46,10 @@ agent accumulates and wants back later, in the right context, without re-derivin
   revision history. Addressed by a **handle**.
 - **Handle** — a short, stable, identity-derived reference to a logical entry
   (`#a3f9c1`), reusable across batches and across syncs (§3.5).
-- **Verdict record** — memoized answer about a rewritten origin line: **landed** or
-  **abandoned** (§9.4).
+- **Verdict record** — memoized positive evidence that a rewritten line landed: a
+  per-origin binding *origin → landed-as commit*, stamped with the matcher that
+  established it; a manual **unlanded** record voids a wrong binding (§9.4).
+  Abandoned is never a record — it is derived per read.
 - **Pending** — clone-local records not yet folded into the store; reads always see
   store ∪ pending (§8.2).
 - **Replica** — a single clone/agent, identified by a local id, for CRDT counters
@@ -108,6 +110,13 @@ leave normal reads for the worklist. Nothing is ever silently destroyed.
 > One rule, no special-casing — a note is visible iff its content is present and its
 > origin line had landed *as of the checkout*. A bisect mode that surfaces later
 > knowledge about unchanged files at old checkouts is **deferred** (§15).
+>
+> **Decision — landings are inferred precision-first.** Rows 5, 9, and 13 rely on
+> the §9.4 matcher ladder to recognize rewritten lines. The ladder never guesses: a
+> landing it cannot prove (e.g. a conflict-adjusted squash whose evidence was
+> destroyed) surfaces on the worklist grouped by line for a one-record manual
+> disposition (`vd`, §9.4) — a visible, bulk-repairable false negative, never a
+> silent loss and never a false landing.
 
 ### 2.2 Folder notes
 
@@ -313,6 +322,8 @@ Execution is **two-phase**:
 | `k` | `k:#handle[:path]`      | confirm valid; re-anchor (split: §9.3)   |
 | `mv`| `mv:old:new`            | relocate notes manually (§6.5); folders: recursive |
 | `rm`| `rm:path`               | tombstone all entries at path (recursive)|
+| `vd`| `vd:sha1:landed:sha2`   | record that sha1 landed as sha2 (§9.4)   |
+| `vd`| `vd:sha1:unlanded`      | void a wrong landing binding (§9.4)      |
 | `al`| `al:#a:#b[:note]`       | add link between two entries, opt comment|
 | `dl`| `dl:#a:#b`              | delete a link between two entries        |
 
@@ -428,7 +439,8 @@ note, or a concept, it is one verb.
 > unconfirmed — §2). A **pending-elsewhere** entry is indistinguishable from a
 > nonexistent one: `r:#handle` errors `✗ #a3f9c1 unknown`, `s` never matches it, and
 > `al`/`dl` refuse it — its notes appear the moment the origin lands, as if newly
-> created. The worklist states (**abandoned**, **orphaned**) likewise never surface
+> created. (On degraded clones, **unknown**-classified origins — §9.4 — behave
+> identically to pending-elsewhere.) The worklist states (**abandoned**, **orphaned**) likewise never surface
 > in reads, search, or link expansion, but they *are* addressable by the repair verbs
 > `k`/`u`/`d` (and `mv`/`rm`) from the worklist (§9.6) — that is how an orphan is
 > re-homed or retired without ever being silently destroyed.
@@ -720,7 +732,14 @@ memoized query result (verdicts, §9.4) or a disposable cache.
 > ULIDs/SHAs), loaded wholesale into maps per invocation — ~1–2 MB at 10k entries,
 > single-digit milliseconds, amortized across the batch. **Pending is never
 > indexed**: it is scanned linearly, per-session small by construction. Similarity
-> memos follow the same pattern (`match-<origin>-<checkout-tree>`). Pre-paid upgrade
+> memos follow the same pattern (`match-<origin>-<checkout-tree>`), joined by two
+> rule-(b) memos (§9.4): **matcher-failure memos** (`nomatch-<tip>-<target-tip>` —
+> a failed m2/m3 attempt never repeats until the target line moves, i.e. per
+> fetch, not per read) and the **unreachability cache** — `{origin → unreachable}`
+> under a refs fingerprint, revalidated incrementally: a fast-forward ref change
+> can never resurrect a dead origin, so ff deltas restamp the fingerprint with one
+> ancestry check per changed ref; only non-ff updates and new refs trigger a
+> rescan, and only from those tips. Pre-paid upgrade
 > paths if profiling (Q2, §14) demands them: mmap'd sorted fixed-width arrays (git
 > pack-`.idx` style) and incremental chaining from the prior index (the store is
 > append-only under union merge, so a new tip's record set is a superset).
@@ -758,8 +777,11 @@ type-specific, body last:
 - `UL <rec-id> <from-id> <to-id>` — unlink.
 - `FB <rec-id> <entry-id> <sig> [reason]` — feedback: `sig` ∈ `+`/`-`/`!`, optional
   free-text reason (body-last rule as usual, §7.3).
-- `VD <rec-id> <origin-commit> <verdict> [<landed-as>]` — memoized rule-(b) verdict
-  (§9.4): `landed <commit>` or `abandoned`; fold rule in §9.4.
+- `VD <rec-id> <origin-commit> landed <landed-as> <matcher>` — memoized rule-(b)
+  landing binding (§9.4); `<matcher>` records the evidence class (`m1`/`m2`/`m3`/
+  `m5`) for auditability. Manual form `VD <rec-id> <origin-commit> unlanded`
+  (minted only by `vd`) voids a wrong binding; largest rec-id wins per origin.
+  There is no stored *abandoned* — that classification is derived per read (§9.4).
 
 > **Decision — id fields hold full ULIDs.** Every
 > id-valued field above (`<entry-id>`, `<from-id>`, `<to-id>`) holds the **full
@@ -847,9 +869,14 @@ re-created with `a`, minting a fresh entry.
 The companion model's outer loop (checkout / merge / commit / push / fetch / unmerged
 / prune) collapses to a single verb:
 
-> **`dm sync`** = fold pending into a store commit → fetch `refs/dm/store` → CRDT
-> union merge (set-union of records; stat counters merge per §7.2) → push, with a
-> fetch-merge-retry loop on a non-fast-forward race.
+> **`dm sync`** = fetch (`refs/dm/store` + code refs) → **mint pass** (§9.4:
+> attempt landings while the evidence — local branch refs plus the fresh target
+> line — is at hand; verdicts append to pending) → fold pending into a store
+> commit → CRDT union merge (set-union of records; stat counters merge per §7.2)
+> → push, with a fetch-merge-retry loop on a non-fast-forward race. A failed push
+> degrades to **fetch-only**: fetch and union merge have already applied locally,
+> and pending clears only on a successful push — a read-only-remote clone gets
+> receive-only behavior plus an error line, losing nothing.
 
 Properties:
 - **Never conflicts** — union of ULID-named records plus CRDT counters; the retry
@@ -889,23 +916,24 @@ write, computed at read time from code-repo state + store ∪ pending.
 | 2 | note added on file F while on main | append **note record** to **pending** (F's blob anchored, origin = main's HEAD) |
 | 3 | branch B from main; note added on G | same as row 2, origin = B's HEAD. Visibility split main/B: **derived** (ancestry check on origin) |
 | 4 | main progresses; note on H added on main | same as row 2. B's non-seeing of H: **derived** |
-| 5 | B rebased onto main (clean) | **nothing at rebase.** First read on B that finds origin not-ancestor-but-present computes the patch-id match and appends a **landed verdict** (old origin → new commit); every replica inherits |
+| 5 | B rebased onto main (clean) | **nothing at rebase.** The rebasing clone's next read finds the succession in the branch reflog (m1, §9.4) and appends per-origin **landed verdicts** (old line → new tip); every replica inherits |
 | 6 | branch C created; CR still on B | **nothing.** Mutual invisibility: **derived** |
 | 7 | note N added on B, no commit/sync yet | append to **pending** only — dirty blob anchored via the store tree. Immediate visibility falls out of reads consulting store ∪ pending |
-| 8 | B rebased with conflict resolution changing G | **nothing at rebase.** (b): landed verdict as row 5. (a): G's drift is **derived** — anchored blob vs. current tree similarity ⇒ stale flag, recomputed per read, never stored |
-| 9 | B merged into main | true merge: **derived** — origin now ancestor of main, zero writes. Squash: first read appends a **landed verdict** (patch-id/tree containment). G's stale flag persists because it keeps being derived, until `k` re-anchors the note to the current blob |
+| 8 | B rebased with conflict resolution changing G | **nothing at rebase.** (b): landed verdict as row 5 — m1 is reflog-based, so conflict resolution doesn't break it. (a): G's drift is **derived** — anchored blob vs. current tree similarity ⇒ stale flag, recomputed per read, never stored |
+| 9 | B merged into main | true merge: **derived** — origin now ancestor of main, zero writes. Squash: the author's next sync mint pass matches the branch's cumulative patch-id against the squash commit (m3, §9.4) and appends **landed verdicts** for the whole segment. G's stale flag persists because it keeps being derived, until `k` re-anchors the note to the current blob |
 | 10 | noted file edited in working tree, uncommitted | **derived** — working blob ≠ anchor ⇒ stale. No write at any point |
 | 11 | noted file renamed/moved | **derived** — anchored blob found at new path (similarity match if also edited ⇒ stale). No re-key record; cache may memoize the match, disposably |
 | 12 | noted file deleted on the current line | **derived** — no match anywhere in tree ⇒ orphaned, worklist is a query. Writes only when the agent acts (tombstone, re-anchor) |
-| 13 | branch B deleted without merging | first read that finds origin unreachable from every local/remote ref and unlanded appends an **abandoned verdict** — persisted so the classification survives GC and replicates |
+| 13 | branch B deleted without merging | **nothing.** A qualified clone (§9.4) derives **abandoned** per read — origin unreachable from every local/remote ref, no landing binding — cheap via the unreachability cache (§8.2); never stored, so a re-pushed branch flips it back with no repair |
 | 14 | teammate clones/pulls the same state | `dm sync` on each side; distinct ULID filenames ⇒ conflict-free union. Identical view is **derived** — same store + same refs ⇒ same answers (asterisk: transient divergence until a needed verdict record exists) |
 | 15 | detached HEAD / bisect at old commit | **derived** — same queries against the detached tree and its ancestry. Writes (if any) persist as row 2, origin = the detached commit |
 
 Durable writes happen at exactly three moments: **note records at write time**
-(rows 2/3/4/7/15), **verdict records at first-read-after-history-rewrite**
-(rows 5/8-b/9-squash/13), **store commits at sync** (row 14). Rows 6, 10, 11, 12 are
-pure queries. There is no per-clone mutable state that could make two clones disagree
-except pending, which is by definition not yet shared.
+(rows 2/3/4/7/15), **verdict records at the mint moments** (rows 5/8-b at read on
+the rewriting clone, row 9-squash at the sync mint pass — §9.4), **store commits
+at sync** (row 14). Rows 6, 10, 11, 12, 13 are pure queries. There is no per-clone
+mutable state that could make two clones disagree except pending, which is by
+definition not yet shared.
 
 **What the model pays** (accepted, on the record):
 - **Read-time cost moves up**: similarity matching per unresolved note at read
@@ -1001,12 +1029,11 @@ read.
 >   derived churn count (§7.1) becomes **recency-scoped** — deliberate: recent
 >   churn is the volatility signal; ancient churn on a since-stable note is noise.
 > - **Verdicts**: a `VD` is droppable **iff no surviving record's origin field
->   matches it**. Landed verdicts are irreplaceable evidence once the origin commit
->   is GC'd (patch-ids can no longer be computed), so they live as long as any
->   record needs them. Abandoned verdicts are re-derivable in principle (absence of
->   evidence re-derives), but the same referential rule keeps them as cheap
->   memoization; their lifetime is bounded by their referencing records — see the
->   lifecycle note below.
+>   matches its origin and no surviving `VD`'s landed-as field references it**
+>   (bindings chain, §9.4). Landed verdicts are irreplaceable evidence once the
+>   origin commit is GC'd (patch-ids and reflogs can no longer be consulted), so
+>   they live as long as any record needs them. There are no abandoned verdicts
+>   to sweep — abandoned is derived per read, never stored (§9.4).
 > - **Blobs**: mark-and-sweep from surviving records' anchor fields; unreferenced
 >   `blobs/<sha>` files drop.
 > - **Stat rows** keyed to purged entries drop from each `stats/<replica-id>` file;
@@ -1022,13 +1049,6 @@ read.
 > compaction sound. Reintroduction by stale full copies is prevented separately by
 > the epoch rule (§8.4).
 >
-> **Abandoned-verdict lifecycle.** An abandoned `VD` is minted at first read that
-> finds an origin unreachable and unlanded (§8.4 row 13); it pins nothing open
-> indefinitely. It lives exactly as long as records carrying that origin: the
-> worklisted entry is eventually tombstoned (`d` → records purge at next sweep),
-> re-anchored (`k`/`u` → the old origin survives only in shadowed revisions, which
-> age out in 3 months), or deliberately kept — in which case keeping its one-line
-> memo is correct, since it is what spares every read the unreachability scan.
 > `TB` lines kept forever pin no verdicts: `TB` has no origin field.
 
 ---
@@ -1173,29 +1193,101 @@ to diff (inherent limit).
 
 ### 9.4 Rule (b) — has the origin landed?
 
-Origin ancestor of HEAD → landed here · else a **landed verdict** exists → landed ·
-else origin reachable from another local/remote ref → pending-elsewhere · else
-abandoned (verdict appended on first computation).
+The fold, per origin O against the current checkout:
 
-**Verdict records** memoize the one thing git structurally forgets — what became of
-rewritten origin lines: **landed** (origin O landed as commit M — squash/rebase,
-matched by patch-id / tree containment) or **abandoned** (origin unreachable from
-all refs, unlanded). Appended lazily by whichever clone first computes the answer;
-union-synced, so every replica inherits it. Record form: `VD` (§8.3). If one origin
-accumulates conflicting verdicts, **landed beats abandoned** — landed is positive
-patch-id evidence, abandoned is absence of evidence (exactly the wrong-abandoned
-case below) — then largest rec-id among landed.
+1. O is an ancestor of HEAD → **landed**.
+2. A winning landing binding `VD O landed M` exists (largest rec-id per origin; a
+   newer `unlanded` record voids) → resolve **M** through this same fold
+   (transitive, depth-bounded — a landed-as commit may itself have been
+   rewritten): M in the checkout's lineage → landed here.
+3. O reachable from another local/remote ref → **pending-elsewhere**. A qualified
+   clone additionally attempts tip-landing for that ref's line (matchers below) —
+   this is how a still-referenced branch's squash is caught.
+4. Else: a **qualified** clone derives **abandoned** — a per-read classification
+   like stale and orphaned, never stored (§2's states stay unstored without
+   exception); a **degraded** clone classifies **unknown**, which behaves exactly
+   like pending-elsewhere (hidden, not worklisted, §5.3).
 
-**Verdict correction**: wrong verdicts are repaired at the note level in v1, with
-verbs that already exist. Wrong *abandoned* (notes wrongly worklisted — e.g. the
-origin lived on a remote dm couldn't see): `k` from the worklist on the right
-checkout — re-anchoring to current blob + HEAD gives the note a fresh origin that
-resolves by plain ancestry, no verdict consulted. Wrong *landed* (notes wrongly
-surfacing on a line their origin never reached): `k` would bless them there —
-instead `d` here and re-add on the correct branch. Accepted v1 caveats: a verdict is
-per-*origin*, so repair is O(notes sharing that origin), and the stale verdict
-lingers in the store. LWW-overridable verdict records stay a later optimization for
-the many-notes-per-origin case (§15), not a v1 requirement.
+**Verdict records** memoize the one thing git structurally forgets — what became
+of rewritten origin lines. Under the redesign they memoize *only positive
+evidence*: landings.
+
+> **Decision — lines land, commits don't.** Intermediate commits never land as
+> themselves: under squash only the branch's final state lands, under rebase every
+> commit is replaced. So landing is established at **line-tip granularity** — a
+> binding "the line ending at tip T landed as commit M" — and every origin on the
+> segment inherits by ancestry into T. Physically the binding is materialized as
+> **per-origin `VD` records** (GC-proof exact keys, §8.3), bulk-minted at binding
+> time: enumerate store ∪ pending origins in `(merge-base..T]` **plus the
+> landed-as commits of existing `VD`s** in that range (or transitive chains
+> break), one record each, stamped with the matcher id. A late-syncing origin on
+> an already-bound line is bound by its own writing replica (which still holds
+> the objects/reflog) or lands on the worklist.
+>
+> **Decision — abandoned is derived, never stored.** Only *landed* is a record.
+> Abandoned — origin unreachable from every ref, no binding — is recomputed per
+> read: a wrong conclusion (shallow clone, missing remote) stays local and
+> self-heals on the next fetch instead of replicating, and a re-pushed branch
+> flips the state back with no repair. Cost: the reachability scan reruns for
+> dead origins — bounded by the ff-aware unreachability cache (§8.2) and by
+> hygiene (a tombstoned or re-homed note stops resolving entirely), so worklist
+> debt now has a read-latency consequence too (tracked by Q1, §14).
+>
+> **Qualified-clone guard.** *Inferring* verdicts (m1–m3) and classifying
+> abandoned require a qualified clone: full history (not shallow) and an all-refs
+> fetch refspec. Degraded clones (`--depth`, `--single-branch` — the CI/sandbox
+> default) consume existing bindings normally but never judge: their unresolvable
+> origins read as **unknown**. Conservative in the right direction — a blind
+> reader under-shows; it never mass-condemns. Manual disposition (`vd`, m5) is
+> explicit agent judgment, not inference, and is allowed from any clone.
+>
+> **Decision — precision-first matcher ladder.** A false negative is worklisted
+> and bulk-repairable; a false positive surfaces wrong notes *unflagged* and
+> replicates. So matchers bind only on evidence that identifies the **line**,
+> never merely the patch — when in doubt, worklist:
+>
+> | # | matcher | binds | guard |
+> | --- | --- | --- | --- |
+> | m1 | local reflog succession | segment | action-filtered: only `rebase*` / `commit (amend)` entries — conflict-proof; `reset:` / `branch -f` / `checkout -B` never bind |
+> | m1r | remote-tracking forced-update | nothing | candidate generator for m2 only — a forced update can't distinguish a forge rebase from branch reuse |
+> | m2 | ancestry replay | segment | **full-segment, in-order** per-commit patch-id pairing (skip empties, pinned diff flags); one unpaired commit → no bind |
+> | m3 | cumulative squash | segment | `patch-id(diff(merge-base..T))` equals exactly **one** commit on the target line; below the **min-diff floor** → no bind (floor rides Q3 calibration, §14) |
+> | m5 | manual disposition (`vd`) | per subject | LWW-overridable; `unlanded` voids |
+>
+> Residual false positives, accepted on the record: commits **dropped** during an
+> interactive rebase bind with their segment (m1; bounded by rule (a));
+> short-segment collisions under branch reuse (m2; bounded by applying the
+> min-diff floor to the *total bound diff*); byte-identical duplicate work above
+> the floor (m3; arguably benign — the identical content did land). Everything
+> else fails toward the worklist.
+>
+> **Mint moments.** m1 runs at any read on the rewriting clone (a reflog scan is
+> cheap). m2/m3 run only at the sync mint pass and on the first read after a
+> fetch, with failures memoized per `(tip, target-tip)` (§8.2) — heavy matching
+> is per-fetch, never per-read. Sync is the load-bearing moment by design: right
+> after fetch, the author's clone holds both the local branch ref (the evidence)
+> and the fresh target line, *before* forge branch auto-delete and GC destroy the
+> evidence (§8.4).
+>
+> **Decision — cherry-pick / backport: accepted gap.** No matcher exists for
+> single-commit picks, deliberately. The tip-granularity model already prevents
+> the two dangerous behaviors (a picked commit never matches a tip's cumulative
+> diff, so it can't land a whole session's notes; fold step 3 no longer
+> short-circuits landing checks for live branches). What remains is a known false
+> negative: notes on a fix cherry-picked to a release line never surface there —
+> rule (b) fails by design. Accepted for v1; the cheap future add is a
+> `cherry-pick -x` **trailer matcher** (exact trailer format only — never bare
+> hash mentions, which reverts also embed) (§15).
+
+**Verdict correction** (`vd:sha1:landed:sha2` · `vd:sha1:unlanded`, §4.2): the
+subject `sha1` is a line tip when its objects are still reachable (bulk-binds the
+whole segment) or a single origin otherwise; the ack reports the bound count
+(`✓ vd landed <sha2> · 3 origins bound`). A wrong *landed* binding is voided by
+one `unlanded` record (largest rec-id wins); a wrong *abandoned* no longer exists
+as a stored class — it corrects itself on the first read after the refs change.
+The worklist groups unresolved origins by line where ancestry is computable
+(§9.6), so one `vd` repairs a whole line — verdict repair is O(lines), not
+O(notes).
 
 ### 9.5 Staleness
 
@@ -1231,7 +1323,10 @@ on offer. Not revisited further.
 (a) layer 4), **abandoned** notes (rule (b)), **ambiguous** follows (splits,
 scatters, multi-candidate matches), **disputed** notes (`FB !`), and — on request —
 stale/unconfirmed notes. It is a pure query over store ∪ pending and the current
-checkout; running it changes nothing.
+checkout; running it changes nothing. Abandoned entries are **grouped by
+origin/line** — one group line per rewritten line (`tip · branch hint · note
+count · matcher hint`; golden format pinned by tests, §11.4) — so a single `vd`
+disposition resolves the whole group (§9.4).
 
 Unlike the companion model's pre-commit gate, the worklist is **never a forcing
 function and never destructive**: an unresolved note stops *surfacing* in normal
@@ -1271,9 +1366,9 @@ layered soft-pressure package below.
 > decision reopens with data (§14).
 
 Worklist entries are resolved with the ordinary verbs: `k` (re-anchor/re-bless), `u`
-(rewrite), `d` (tombstone), `mv` (manual re-home), `rm` (retire a dead path).
-Worklist-state notes are addressable by exactly these repair verbs and are invisible
-everywhere else (§5.3).
+(rewrite), `d` (tombstone), `mv` (manual re-home), `rm` (retire a dead path), `vd`
+(record where a rewritten line landed, §9.4). Worklist-state notes are addressable
+by exactly these repair verbs and are invisible everywhere else (§5.3).
 
 ---
 
@@ -1307,7 +1402,7 @@ follows the checkout automatically, and sharing is one idempotent verb.
 | clone setup | `git clone` | `dm init` (once) |
 | branch / rebase / squash / merge / switch | plain git, any strategy | **nothing** — visibility follows automatically (§2) |
 | working | edit + `git commit` | **inner loop**: `r:` before touching, `a`/`u`/`d`/`f`/`al` on learning |
-| wrap up / share | `git push` | `dm sync`; skim `dm worklist`, resolve what has fresh context (`k`/`u`/`d`/`mv`/`rm`) |
+| wrap up / share | `git push` | `dm sync`; skim `dm worklist`, resolve what has fresh context (`k`/`u`/`d`/`mv`/`rm`/`vd`) |
 
 **Inner-loop discipline.**
 1. **Read before touching** a file: `r:path` for the surface, `r:path:1` to orient
@@ -1371,7 +1466,8 @@ concise.
 > teammates' notes) to share both notes and read-stats; its footer reports how much
 > wants judgment. Skim **`dm worklist`** at wrap-up — it leads with items near your
 > session's work — and resolve what you have context for: `k` (still valid), `u`
-> (rewrite), `d` (obsolete), `mv`/`rm` (re-home / retire a path).
+> (rewrite), `d` (obsolete), `mv`/`rm` (re-home / retire a path), `vd` (say where
+> a rewritten branch landed).
 
 ---
 
@@ -1419,6 +1515,13 @@ pure rename; a move-with-edit inside and below the §9.2 bands; a folder split
 ambiguity. Where possible it reuses the worked examples from §4–§7
 (`api/handler.rb`, the `api/` arch note `#f22e90`, `db/schema.rb #a3f9c1`) so the
 doc's illustrative output is literal golden output.
+
+For the §9.4 matcher ladder the fixture adds one branch per matcher state —
+clean-rebased, conflict-rebased, force-push-rewritten (clean and conflicted),
+squash-landed (clean · update-branch · conflicted · sub-floor · twin-candidate),
+reused-name, dropped-commit interactive rebase, cherry-picked, and a two-hop
+landing chain — plus a shallow and a single-branch clone of the base repo for the
+qualified-clone guard.
 
 **Guard tests.** Because the fixture is built *through* `dm` (`a` etc.) rather than
 seeded at the storage layer, a small set of guard tests asserts that the build
@@ -1469,8 +1572,97 @@ to snapshot sync results; devs use it to inspect what actually landed.
   demoted; worklist/drill lines carry vote · margin · coverage; `k:#h:path` re-homes
   one entry while sibling entries stay ambiguous; plain `k` blesses an unconfirmed
   follow; scatter appears only on the worklist (§9.3).
-- **Verdicts** — squash and rebase landings, abandoned branches, the
-  landed-beats-abandoned fold, wrong-verdict repair (§9.4).
+- **Landing inference** (§9.4) — every scenario asserts minted `VD`s *with their
+  matcher id* via `dm dump`. Notation: `feature` = F1→F3 off main, note N1 with
+  origin F1, N2 with origin F2 (intermediate), squash commit S.
+  - *m1 — local reflog succession:*
+    **m1-rebase-clean** — clean `git rebase main`; the next read shows N1+N2 on
+    the rebased branch and per-origin `m1` VDs in pending (minted at read,
+    before any sync).
+    **m1-rebase-conflict** — conflict resolution changes noted file G; m1 still
+    binds (reflog needs no patch match); G surfaces `⚠stale` via rule (a).
+    **m1-amend** — `commit --amend` binds old→new.
+    **m1-reset-no-bind** *(FP guard)* — `reset --hard main` (reflog action
+    `reset:`): no VD; the origin classifies derived-abandoned.
+    **m1-branch-reuse-no-bind** *(FP guard)* — `checkout -B feature <unrelated>`:
+    the action filter rejects; no binding.
+    **m1-drop-accepted-fp** *(accepted FP, pinned)* — interactive rebase drops
+    F2: the segment still binds; N2 (on an unchanged file) lands with it, while
+    a sibling note on the *dropped content* stays invisible via rule (a).
+  - *m1r/m2 — rewrites performed elsewhere:*
+    **m2-remote-rebase-clean** — replica B force-pushes a clean rebase; A's
+    fetch (forced-update = m1r candidate only) plus full in-order pairing mints
+    `m2` VDs.
+    **m1r-alone-no-bind** *(FP guard)* — forced-update to an unrelated occupant:
+    no pairing, no bind; old origins classify derived-abandoned.
+    **m2-tip-only-no-bind** *(FP guard)* — tips pair but earlier commits don't:
+    no bind (pins the full-segment, in-order requirement).
+    **m2-conflict-heals** *(FN + self-heal)* — B's conflicted rebase: A derives
+    abandoned (no record — dump asserts), B's read mints m1, both sync, A's
+    next read shows landed and a clear worklist.
+    **m2-floor-no-bind** *(FP guard)* — trivial one-commit segment under branch
+    reuse: below the min-diff floor, no bind.
+  - *m3 — cumulative squash:*
+    **m3-squash-multi-commit** *(flagship)* — forge-style squash S, remote
+    branch deleted, author keeps the local ref. Before the author's sync,
+    teammates see nothing (pins the eventual-consistency window); the author's
+    sync mint pass binds F3→S, bulk-mints `m3` VDs for F1 *and intermediate F2*,
+    and pushes them in the same sync; the teammate's next sync shows N1+N2 on
+    main.
+    **m3-update-branch-flow** — merge main into feature (T2), then squash:
+    binds at T2; segment enumeration excludes main-side commits.
+    **m3-conflicted-squash-FN** — divergent squash content: no bind; the
+    worklist groups the line (`tip · branch hint · note count · matcher hint` —
+    golden format).
+    **m3-two-candidates-no-bind** *(FP guard)* — apply → revert → re-apply on
+    main: two patch-id-identical candidates, no auto-bind.
+    **m3-floor-FN** — one-line branch squashed: below the floor, worklist with
+    hint.
+    **m3-duplicate-work-accepted-fp** *(accepted FP, pinned)* — a byte-identical
+    independently-authored cumulative diff landed on main binds the dead
+    branch; its notes land.
+  - *m5 — disposition & override:*
+    **m5-disposition** — from the conflicted-squash state, one
+    `vd:<tip>:landed:S` surfaces *all* notes on the line; VD stamped `m5`.
+    **m5-unlanded-override** — an `unlanded` record with larger rec-id
+    (injected clock) voids a wrong binding; the note falls back to reachability
+    classification.
+    **vd-lww-determinism** — conflicting VDs from two replicas fold to the same
+    winner in both sync orders.
+  - *Qualified-clone guard:*
+    **shallow-no-mint** — `clone --depth 1`: unresolved origins read as unknown
+    (hidden, not worklisted), zero VDs minted; the same state on a full clone
+    worklists abandoned — pins the poisoning fix.
+    **single-branch-no-mint** — same guard for `--single-branch`; existing
+    landed VDs are still consumed normally.
+  - *Derived abandoned & unreachability cache:*
+    **abandoned-derived-not-stored** — deleted unmerged branch: worklisted;
+    dump shows no record of it.
+    **abandoned-resurrect** — recreate the ref at the old tip: the next read
+    flips back to pending-elsewhere, no repair verb involved.
+    **cache-ff-safe / cache-nonff-invalidate** — ff commits/pulls keep the
+    cached classification (cheap path); a ref appearing at the origin
+    invalidates it on the next read (§8.2).
+  - *Sync mechanics:*
+    **mint-pass-order** — a single post-squash `dm sync` both mints and pushes;
+    the teammate needs no extra step (pins mint-after-fetch-before-push).
+    **push-fail-fetch-only** — read-only remote: fetch + union merge apply
+    (teammate notes become visible), pending stays intact, error in the footer;
+    the next successful sync clears pending exactly once.
+    **evidence-destroyed-window** — writer clone gone after record-sync, branch
+    ref deleted, never fetched elsewhere: qualified clones derive abandoned,
+    the worklist groups by line, m5 repairs in bulk.
+  - *Chains & accepted gaps:*
+    **vd-chain-transitive** — feature lands on `dev` as S1 (m3); `dev` is later
+    rebased onto main (S1→S1′, m1 on the performing clone); the fold resolves
+    F1 → S1 → S1′ — pins that segment enumeration includes landed-as commits of
+    existing VDs.
+    **cherry-pick-no-overbroad** *(pinned fix)* — pick F2 onto main, delete
+    feature: no line binding, no F-origin notes on main; origins classify
+    derived-abandoned.
+    **backport-gap** *(accepted FN, pinned)* — fix + note on main, commit
+    picked to `release-1.x`: the note is never visible on the release line
+    (§9.4's accepted-gap decision).
 - **Sync** — two replicas, union convergence, non-ff retry, stat counter merge
   (G-Counters sum across replicas; LWW `t` picks the max).
 - **Compaction** — `dm gc` drops what the §8.7 rules say and nothing else; epoch
@@ -1537,8 +1729,8 @@ The questions once tracked here (Q3–Q14) are settled; each decision lives as a
 decision block in its home section. The historical ids — used by the archived
 [review](archive/review.md) and plan — map as: Q3 §9.3 · Q4 §9.6 · Q5 §2.1 ·
 Q6 §8.1/§8.3 · Q7 §6.5 · Q8 §8.7 · Q9 §3.5 · Q10 §8.3 · Q11 §8.2 · Q12 §4.2 ·
-Q13 §8.2 · Q14 §15. What remains is empirical: two gates (Q1, Q2) that can only be
-verified with v1 built, both running on the §11.4 harness.
+Q13 §8.2 · Q14 §15. What remains is empirical: three gates (Q1–Q3) that can only
+be verified with v1 built, all running on the §11.4 harness.
 
 - **Q1 — does resolution follow ordinary edit churn?** The premise to verify: that
   everyday editing rarely drops notes to layer 4 (unresolved) of §9.1 — if it
@@ -1546,7 +1738,9 @@ verified with v1 built, both running on the §11.4 harness.
   repo's history against seeded notes (§11.4) and measure the fraction resolving
   via layers 1–3. The same runs calibrate the acceptance-band fractions (§9.2,
   §9.3) and track the hygiene metrics (§9.6) — worklist backlog growth, stale
-  fraction, usefulness ratio (§9.6).
+  fraction, usefulness ratio (§9.6). Worklist debt now also carries a
+  **read-latency** consequence (derived-abandoned re-checks, §9.4), so backlog
+  growth is tracked against read timings too.
 - **Q2 — read-path performance on large repos.** The caches (§8.2) and verdict
   records (§9.4) reduce steady-state reads to an index load plus tree lookups;
   what needs profiling is the residue: the **cold path** (first read after a
@@ -1554,12 +1748,23 @@ verified with v1 built, both running on the §11.4 harness.
   multiplicity** (one batched origin→checkout diff per *distinct origin* among
   unresolved notes, and origins accumulate over a store's life), **checkout-side
   lookup** (anchored blob → current tree plus working-tree dirt, recomputed per
-  invocation — the working tree has no stable key to memoize under), and
+  invocation — the working tree has no stable key to memoize under),
   **pending-elsewhere re-checks** (a live state, never memoized: all-refs
-  reachability reruns until the origin lands or is abandoned). Profiling matrix:
-  repo size × cold/warm cache × checkout age × unresolved-note count. If the index
-  itself bottlenecks, the upgrade paths are pre-paid (§8.2: mmap'd arrays,
-  incremental chaining).
+  reachability reruns until the origin lands or is abandoned),
+  **derived-abandoned re-checks** (also live — bounded by the ff-aware
+  unreachability cache, §8.2, and by worklist hygiene), and **matcher attempts**
+  (per-fetch, not per-read, via the `(tip, target-tip)` failure memos — the cost
+  lands at sync, §9.4). Profiling matrix: repo size × cold/warm cache × checkout
+  age × unresolved-note count × dead-origin count × ref count / fetch cadence. If
+  the index itself bottlenecks, the upgrade paths are pre-paid (§8.2: mmap'd
+  arrays, incremental chaining).
+- **Q3 — landing-detection precision and recall.** The §9.4 matcher ladder is
+  precision-first by construction; what needs measuring is whether recall is high
+  enough that the worklist residue stays small. Rig: replay real repo histories
+  (squash-merge-heavy, force-push-heavy) with seeded notes; measure per matcher
+  id the false-binding rate (must be ~zero) and the fraction of genuinely-landed
+  lines each matcher recovers; calibrate the m3 min-diff floor. Runs on the same
+  §11.4 harness as Q1.
 
 ---
 
@@ -1578,8 +1783,9 @@ verified with v1 built, both running on the §11.4 harness.
   running it automatically at sync past a size/garbage threshold is a later knob.
 - **Lamport counters in record headers** — retire the wall-clock caveat on
   ULID-ordered LWW folds (§8.3) without changing transport.
-- **LWW-overridable verdict records** — batch repair for the many-notes-per-origin
-  case (§9.4); v1 repairs at the note level.
+- **cherry-pick trailer matcher** — an exact-format `(cherry picked from commit …)`
+  matcher closing the backport gap (§9.4's accepted-gap decision); never bare
+  hash mentions (reverts embed hashes too).
 - **team-shared vs per-clone stats** — already merged via CRDT counters; revisit if
   per-clone granularity turns out to matter.
 - **duplicate signal** — none for v1; agent cleans up via CRUD (§6.3).
