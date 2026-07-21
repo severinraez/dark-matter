@@ -107,7 +107,9 @@ no visibility semantics.
 here) · **abandoned** (origin line deleted without landing) · **orphaned** (described
 content no longer exists anywhere dm can place it). Stale and orphaned are distinct by
 design: drift dm can locate is flagged and stays usable; only notes dm cannot place
-leave normal reads for the worklist. Nothing is ever silently destroyed.
+leave normal reads for the worklist. Nothing is ever silently destroyed. (On a
+degraded clone — §9.4's qualified-clone guard — an unresolvable origin reads as
+**unknown**, a local-only classification presenting exactly as pending-elsewhere.)
 
 > **Decision — strict lineage stands.** Row 15 is read
 > strictly: notes written *later on main itself* stay hidden from old-main checkouts.
@@ -132,7 +134,7 @@ about rule (a).
 | --- | --- | --- |
 | 1 | note added on folder `api/` while on main | visible whenever the checkout contains path `api/` and descends from main |
 | 2 | files under `api/` added, edited, deleted — any member churn | note stays visible and **fresh** — a folder note describes the place, not the contents; member churn alone never flags it |
-| 3 | all lineage cases: branch isolation, landing by merge/squash/rebase, abandoned branch, teammate clone, detached HEAD | identical to file-note rows 3–9 and 13–15 above with "folder note" substituted — nothing folder-specific in rule (b) |
+| 3 | all lineage cases: branch isolation, landing by merge/squash/rebase, abandoned branch, teammate clone, detached HEAD, per-record revision propagation | identical to file-note rows 3–9 and 13–16 above with "folder note" substituted — nothing folder-specific in rule (b) |
 | 4 | `git mv api/ svc/`, no member edits | note follows to `svc/`, fresh |
 | 5 | `git mv api/ svc/` plus member edits | follows to `svc/`; fresh when the whole folder evidently moved together, flagged unconfirmed when the evidence is partial |
 | 6 | most members move to `svc/`, the rest deleted | follows to `svc/`, flagged |
@@ -374,7 +376,7 @@ c #7c22a1 Validates tenant header before dispatch (+4 lines)
 → 1 concept #9d8134 event-sourcing
 context: 1 own · 2 parent · 1 link · ~6 hidden
 ▸r:#f22e90
-api/ [a] #f22e90 ⚠stale
+api/ [a] #f22e90 ⚠disputed
 api reaches db only through repo/. Handlers must never import
 models directly — the repository layer owns persistence + tenant scoping.
 → links: #a3f9c1 schema STI · #4c1180 tenancy
@@ -548,8 +550,9 @@ homed at a path (recursive for folders): the node-level counterpart to `d:#handl
 for paths whose knowledge is genuinely gone. Both remain ordinary batch commands.
 
 > **Decision — `mv` relocates, never blesses; both verbs are write-time macros.**
-> `mv:old:new` appends one **`RP` (re-path, §8.3)** record per **visible** entry
-> homed at `old` (recursive for folders): a new path hint plus a scoping origin
+> `mv:old:new` appends one **`RP` (re-path, §8.3)** record per entry homed at
+> `old` that is **visible or worklist-state** here (recursive for folders): a
+> new path hint plus a scoping origin
 > (HEAD — the line on which the move was observed; per-record rule (b), §8.3);
 > the entry's content anchor is untouched. Consequences, each deliberate:
 > `⚠stale` keeps measuring the bytes the note actually described, so a bulk
@@ -558,14 +561,16 @@ for paths whose knowledge is genuinely gone. Both remain ordinary batch commands
 > outside the §7.3 dispute rule — a relocation is not a resolution); and sibling
 > branches are untouched — they fold without the `RP` until the move's line
 > lands there, so the hint can never mislead a line where the move hasn't
-> happened. For folder notes the path *is* the anchor, so
-> the prefix-substituted `RP` is the complete move. Blessing stays with `k`/`u`,
+> happened. For folder notes resolution keys on the folded path (§9.3), so
+> the prefix-substituted `RP` is the complete move — the anchor keeps addressing
+> the write-time fingerprint. Blessing stays with `k`/`u`,
 > per note. A below-threshold move needs the pinned resolution layer (§9.1) to
 > surface at the destination; if the destination file is absent from the working
 > tree, the expansion fails as a **per-entry error** in batch output (`mv`
 > describes a move that happened; it does not invent one). `rm:path` expands to
-> one `TB` per visible entry, recursive likewise. Entries not yet visible (e.g.
-> pending on an unmerged branch) are untouched — when they land they surface as
+> one `TB` per visible-or-worklist-state entry, recursive likewise — orphans at
+> a dead path are exactly its target. Pending-elsewhere entries (e.g. on an
+> unmerged branch) are untouched — when they land they surface as
 > residue and get their own fix; that is the uniform drift path, not a gap.
 > Path-scoped redirect records stay rejected: redirects are rules that outlive
 > their evidence (chaining, cycles, precedence against automatic resolution,
@@ -655,9 +660,9 @@ a still-standing complaint re-flags by being re-filed. Implicit signals still co
 - **Ranking** gains usefulness ratio + expansion rate once the weighted scoring
   function lands (§15); v1 collects but does not rank on them (§5.6).
 - **Surface flags** stay token-disciplined: only *behavior-changing* signals are
-  shown — `⚠disputed` (from `!`), `⚠stale` (content drift, §9.5), and `⚠unconfirmed`
-  (uncertain follow, §9.3). Positive signal is expressed silently through ordering,
-  not badges.
+  shown — `⚠disputed` (from `!`), `⚠stale` (content drift, §9.5), `⚠unconfirmed`
+  (uncertain follow, §9.3), and `⚠split` (ambiguous folder follow, §9.3). Positive
+  signal is expressed silently through ordering, not badges.
 - **Housekeeping** (data supports it now; the agent-facing report is the worklist,
   §9.6): never-expanded notes past an age, disputed notes, high-churn notes, drifted
   notes → a prune/review worklist.
@@ -755,10 +760,11 @@ memoized query result (verdicts, §9.4) or a disposable cache.
 > rule-(b) memos (§9.4): **matcher-failure memos** (`nomatch-<tip>-<target-tip>` —
 > a failed m2/m3 attempt never repeats until the target line moves, i.e. per
 > fetch, not per read) and the **unreachability cache** — `{origin → unreachable}`
-> under a refs fingerprint, revalidated incrementally: a fast-forward ref change
-> can never resurrect a dead origin, so ff deltas restamp the fingerprint with one
-> ancestry check per changed ref; only non-ff updates and new refs trigger a
-> rescan, and only from those tips. Pre-paid upgrade
+> under a refs fingerprint, revalidated incrementally and always **delta-scoped**:
+> a fast-forward rescans only its delta (`old..new`) — a ff *can* resurrect a
+> dead origin, by fetching the origin itself or a merge parent descending from
+> it — while non-ff updates and new refs rescan from their tips; commits already
+> covered by the fingerprint are never rewalked. Pre-paid upgrade
 > paths if profiling (Q2, §14) demands them: mmap'd sorted fixed-width arrays (git
 > pack-`.idx` style) and incremental chaining from the prior index (the store is
 > append-only under union merge, so a new tip's record set is a superset).
@@ -898,11 +904,18 @@ extended from entries to revisions. Consequences, each deliberate:
   dies with that line; every other line keeps folding the prior state. A truly
   abandoned entry (no landed record anywhere) is still rescuable from the
   worklist — `k` mints an `RA` with a live origin.
+- A landed `RA`/`RP` can carry the entry alone (the **rescue fold**): when a
+  checkout's landed set holds no body-carrying record, the body — and, where no
+  landed `RA` supplies one, the anchor — fold from the newest `CR`/`SU`
+  preceding the newest landed record (rec-id order): the revision its writer
+  acted on. Compaction pins exactly that record (§8.7).
 - After a mainline `u`, an unmerged branch reads the *superseded* body — the
   revision that corresponds to its content — rather than nothing; the new
   revision arrives when main lands there.
-- Each `RA`'s origin tree contains that `RA`'s anchor, so §9.2's two-point
-  invariant holds per record and folder fingerprints stay fresh.
+- Each `RA`'s origin tree contains that `RA`'s anchor — up to working-tree dirt
+  (§8.4 row 7: a dirty-file `k` anchors bytes HEAD lacks; §9.2's direct
+  blob-scoring covers that case) — so §9.2's two-point invariant holds per
+  record and folder fingerprints stay fresh.
 
 `TB` stays global — it carries no origin and is absorbing everywhere (tombstone
 decision below). `FB`/`LN`/`UL` stay global too: a complaint or link travels
@@ -1100,7 +1113,9 @@ read.
 >   suppresses (the entry's `CR`/`SU` bodies, `LN`/`UL`/`FB`, stat rows, anchored
 >   blobs) is reclaimed immediately at the next sweep.
 > - **Shadowed revisions** (`CR`/`SU` hidden behind a later `SU`): dropped when
->   older than **3 months** (rec-id ULID age). Within the window they stay, so the
+>   older than **3 months** (rec-id ULID age) — except the newest `CR`/`SU`
+>   preceding each surviving `RA`/`RP` (rec-id order), which is pinned: it is
+>   the body the rescue fold reaches for (§8.3). Within the window they stay, so the
 >   derived churn count (§7.1) becomes **recency-scoped** — deliberate: recent
 >   churn is the volatility signal; ancient churn on a since-stable note is noise.
 >   Per-record-fold caveat (§8.3): an unmerged line older than the window may
@@ -1211,7 +1226,10 @@ key on — hashing the path is still a path key, just unreadable, and the tree S
 globally volatile by construction (any edit to any file under the folder changes
 it). So the path itself is the key, and the **origin commit supplies the matching
 fingerprint** that the anchored blob supplies for files: the origin's tree at the
-noted path — its tree SHA and member set at write time.
+noted path — its tree SHA and member set at write time. (At read time the path
+consulted is the entry's **folded** path — the LWW hint with any landed `RP`
+participating, §8.3/§6.5; the anchor's path key names where the origin-side
+fingerprint is taken.)
 
 Resolution is the same two-point comparison, origin → checkout:
 
@@ -1391,8 +1409,8 @@ O(notes).
 The write-time anchor is half of every note's identity (§3.1), so staleness is not a
 bolt-on check but the gap the anchors measure: on read, the anchored blob is
 compared against the tree (rule (a)); any mismatch that still resolves surfaces the
-note flagged `⚠stale` (files) or `⚠unconfirmed` (folders, §9.3). Flags are
-*display*, not ranking, in v1 (§5.6).
+note flagged `⚠stale` (files) or `⚠unconfirmed` (folders, §9.3). Flags demote
+within their proximity group (§5.6) but carry no weighted score in v1.
 
 **Decision — granularity.** Whole-file, matching file-level note granularity. A
 region/line anchor would be more precise but rots (line ranges shift under edits);
@@ -1677,9 +1695,10 @@ to snapshot sync results; devs use it to inspect what actually landed.
   superseded body (its lineage's newest) while main reads rev 2; landing main on
   B switches B to rev 2. **k-on-abandoned-branch-contained**: `k` from branch F,
   F deleted unmerged: every other line folds the pre-`k` state; the dangling
-  `RA` is inert and swept as garbage. **abandoned-rescue**: entry with no landed
+  `RA` is inert and kept — no sweep rule targets it, and a re-pushed F folds it
+  again (§9.4 resurrection). **abandoned-rescue**: entry with no landed
   record anywhere → worklist; `k` mints an `RA` with a live origin → visible on
-  that line. **concurrent-su-per-line**: `SU`s on two unmerged lines — each line
+  that line with the pre-rescue body (rescue fold, §8.3). **concurrent-su-per-line**: `SU`s on two unmerged lines — each line
   reads its own; the first checkout containing both folds to the larger rec-id
   (pinned clock). **rp-scoped**: `mv` on branch F; on main (file unchanged at
   the old path) the entry resolves at the old path — the `RP` hasn't landed —
@@ -1760,9 +1779,11 @@ to snapshot sync results; devs use it to inspect what actually landed.
     dump shows no record of it.
     **abandoned-resurrect** — recreate the ref at the old tip: the next read
     flips back to pending-elsewhere, no repair verb involved.
-    **cache-ff-safe / cache-nonff-invalidate** — ff commits/pulls keep the
-    cached classification (cheap path); a ref appearing at the origin
-    invalidates it on the next read (§8.2).
+    **cache-ff-delta / cache-nonff-invalidate** — a linear ff of unrelated
+    commits keeps the cached classification after its delta scan (cheap path);
+    an ff pull whose delta brings in the dead origin's line flips it to
+    pending-elsewhere on the next read; a ref appearing at the origin
+    invalidates it likewise (§8.2).
   - *Sync mechanics:*
     **mint-pass-order** — a single post-squash `dm sync` both mints and pushes;
     the teammate needs no extra step (pins mint-after-fetch-before-push).
@@ -1845,12 +1866,14 @@ companions.
 
 ## 14. Open Questions — build-time validation gates
 
-The questions once tracked here (Q3–Q14) are settled; each decision lives as a
-decision block in its home section. The historical ids — used by the archived
-[review](archive/review.md) and plan — map as: Q3 §9.3 · Q4 §9.6 · Q5 §2.1 ·
-Q6 §8.1/§8.3 · Q7 §6.5 · Q8 §8.7 · Q9 §3.5 · Q10 §8.3 · Q11 §8.2 · Q12 §4.2 ·
-Q13 §8.2 · Q14 §15. What remains is empirical: three gates (Q1–Q3) that can only
-be verified with v1 built, all running on the §11.4 harness.
+The questions once tracked here (historical Q3–Q14) are settled; each decision
+lives as a decision block in its home section. The historical ids — used by the
+archived [review](archive/review.md) and plan, unrelated to the gate ids below —
+map as: old-Q3 §9.3 · old-Q4 §9.6 · old-Q5 §2.1 · old-Q6 §8.1/§8.3 ·
+old-Q7 §6.5 · old-Q8 §8.7 · old-Q9 §3.5 · old-Q10 §8.3 · old-Q11 §8.2 ·
+old-Q12 §4.2 · old-Q13 §8.2 · old-Q14 §15. What remains is empirical: three
+gates (Q1–Q3) that can only be verified with v1 built, all running on the §11.4
+harness.
 
 - **Q1 — does resolution follow ordinary edit churn?** The premise to verify: that
   everyday editing rarely drops notes to layer 5 (unresolved) of §9.1 — if it
