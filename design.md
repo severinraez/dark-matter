@@ -1,12 +1,10 @@
 # Dark Matter — Design
 
-> **Status:** architecture settled 2026-07-19 — the **content-addressable model**
-> (notes anchored to content + origin, one shared store, visibility computed per read)
-> is adopted, superseding the companion-branch model (rejected; §13). The behavioral
-> requirements (§2) and the mechanics (§3–§12) are normative, with design decisions
-> recorded as dated decision blocks in their sections. What remains is empirical —
-> two build-time validation gates (§14); intentionally punted scope is §15
-> (Deferred).
+> **Status:** architecture settled — the **content-addressable model**
+> (content + origin anchors, one shared store, visibility computed per read) is
+> normative (§2–§12, decisions as blocks in their sections); the
+> companion-branch model is rejected (§13). Remaining work is empirical — two
+> build-time validation gates (§14); deferred scope is §15.
 
 ---
 
@@ -56,20 +54,16 @@ agent accumulates and wants back later, in the right context, without re-derivin
   (§8.5).
 - **Subject** — the kind of knowledge a note carries: code / architecture /
   development / operations (§3.3).
-- **LWW register** — a single-valued field merged **last-write-wins**: when two
-  replicas set it concurrently, the merge keeps the value with the higher position in
-  a **total order** (so every replica picks the same winner) and discards the other.
-  Two order sources are used: the `t` stat register merges by **max timestamp** (equal
-  timestamps carry the same value, so no tiebreak is needed), while record-log
-  resolution (current body, anchor) orders by the winning record's `<rec-id>` ULID
-  (§8.3). Everything else in the stats is a set/counter that unions.
+- **LWW register** — a single-valued field merged **last-write-wins** under a
+  deterministic total order: the `t` stat register by max timestamp, record-log
+  fields (current body, anchor) by winning `<rec-id>` ULID (§8.3). Everything else
+  in the stats is a set/counter that unions.
 
 ---
 
 ## 2. Behavioral Requirements
 
-Mechanism-free specification of how dm must behave (file notes agreed 2026-07-18;
-folder notes the same day). These tables are **normative**: the storage (§8) and
+Mechanism-free specification of how dm must behave. These tables are **normative**: the storage (§8) and
 resolution (§9) machinery exists to satisfy them, and the test scenarios (§11) replay
 them row by row.
 
@@ -109,7 +103,7 @@ content no longer exists anywhere dm can place it). Stale and orphaned are disti
 design: drift dm can locate is flagged and stays usable; only notes dm cannot place
 leave normal reads for the worklist. Nothing is ever silently destroyed.
 
-> **Decision — strict lineage stands (2026-07-21, resolves Q5).** Row 15 is read
+> **Decision — strict lineage stands.** Row 15 is read
 > strictly: notes written *later on main itself* stay hidden from old-main checkouts.
 > One rule, no special-casing — a note is visible iff its content is present and its
 > origin line had landed *as of the checkout*. A bisect mode that surfaces later
@@ -142,7 +136,7 @@ about rule (a).
 replace **stale** with **unconfirmed**: a folder note is never content-stale (row 2),
 only follow-uncertain (rows 5, 6, 9).
 
-**Rows 13/14 — accepted** (2026-07-18): exact-path-wins shadows a real move (13) and
+**Rows 13/14 — accepted**: exact-path-wins shadows a real move (13) and
 resurrects long-buried notes (14). Accepted as-is: the behavior is right for
 place-notes, and `k`/`u` repair the rest. An "occupant changed" flag (current contents
 share nothing with write-time contents) remains a possible later softening, not v1
@@ -230,11 +224,10 @@ case write-time extension cannot see — two replicas concurrently minting the s
 handle for different entries, discovered only at sync — is handled at resolve time: a
 handle that matches several entries errors with the extended candidates
 (`✗ #a3f9c1 ambiguous: #a3f9c1k2 · #a3f9c1p9`), and surfaces display the extended
-forms. (Resolved 2026-07-20: entry-ids mint with **fresh randomness** — monotonic
+forms. (Entry-ids mint with **fresh randomness** — monotonic
 mode is scoped to rec-ids, §8.3 — so tail-prefix handles keep their full entropy;
 and stored records always hold **full entry-id ULIDs**, never handles, so a
-cross-replica handle collision is an ambiguity error, never record corruption —
-Q9/Q10.)
+cross-replica handle collision is an ambiguity error, never record corruption.)
 
 > **Decision:** internal ids are **ULIDs** — globally unique without coordination,
 > lexicographically sortable by creation time (a natural tiebreak), and independent of
@@ -286,8 +279,7 @@ Execution is **two-phase**:
 > line separator that divides commands: a body newline is written as a trailing `\`
 > continuation, so a command runs until the first line **not** ending in `\`.
 >
-> **Decision — path-field escaping (2026-07-21, resolves review nit E3's grammar
-> half).** Splitting is unchanged: fields split left-to-right on raw `:`, final
+> **Decision — path-field escaping.** Splitting is unchanged: fields split left-to-right on raw `:`, final
 > field greedy. After splitting, every **path-valued field** is **percent-decoded**;
 > all other fields (bodies, reasons, link notes, search terms, handles, subjects)
 > are never decoded. Input needs exactly two escapes: a literal `%` in a path is
@@ -324,7 +316,7 @@ Execution is **two-phase**:
 | `al`| `al:#a:#b[:note]`       | add link between two entries, opt comment|
 | `dl`| `dl:#a:#b`              | delete a link between two entries        |
 
-> **Decision — same-batch backreference (2026-07-20, resolves Q12).** `$N` refers to
+> **Decision — same-batch backreference.** `$N` refers to
 > the entry created by the batch's **Nth command** (1-based; commands, not physical
 > lines — bodies may span lines via `\`). It is accepted anywhere a `#handle` is
 > (`u`, `d`, `f`, `k`, `al`, `dl`, `r`). `$N` must point to an **earlier** command
@@ -342,29 +334,23 @@ characters:
   the previous one.
 - **end-marker** `◾` (U+25FE) prefixes the terminal footer.
 
-> **Decision — printable glyphs, not control bytes.** ASCII RS/GS (`0x1E`/`0x1D`) were
-> considered — near-zero token cost, impossible in text — and rejected: agents read
-> `dm` through terminals, shell captures, and API layers that routinely strip or
-> mangle C0 control bytes, which would corrupt the framing in exactly the channel the
-> tool targets. The glyphs survive every such channel, are debuggable by eye, and cost
-> ~1 token each. Unambiguity is enforced at the write end instead: `dm` **rejects `▸`
-> and `◾` in note bodies** (`✗` error) — they are pure decoration characters with no
-> plausible use in a note — so a body line can never be mistaken for a boundary. (C0
-> control bytes are rejected in bodies too, keeping output shell-safe — **except
-> tab**, see the amendment.)
->
-> **Amendment — tab is whitelisted (2026-07-21, resolves review nit E2).** Tab is
-> the one C0 byte that is ordinary text: Makefiles require it, gofmt'd Go is
-> tab-indented, and pasted snippets are exactly what a `d` note holds — the blanket
-> ban collided with the tool's own pitch. Every channel the framing decision worries
-> about passes tab untouched, and tab breaks neither the grammar nor the records
-> (bodies are the final field, never split). So bodies reject **C0 except tab**;
-> newline already has its `\` representation (§4.1). The genuinely channel-hostile
-> bytes (NUL, escape, RS/GS, …) stay banned — they have no plausible use in a note.
-> Tab in *path* fields still percent-encodes as C0 (§8.3). Silent tab→space
-> conversion was rejected: it would corrupt the pasted snippet (a Makefile line
-> copied back out would be syntactically wrong), against the
-> never-silently-altered principle.
+> **Decision — printable glyphs, not control bytes.** ASCII
+> RS/GS (`0x1E`/`0x1D`) were considered — near-zero token cost, impossible in text —
+> and rejected: agents read `dm` through terminals, shell captures, and API layers
+> that routinely strip or mangle C0 control bytes, which would corrupt the framing in
+> exactly the channel the tool targets. The glyphs survive every such channel, are
+> debuggable by eye, and cost ~1 token each. Unambiguity is enforced at the write end
+> instead: `dm` **rejects `▸` and `◾` in note bodies** (`✗` error) — they are pure
+> decoration characters with no plausible use in a note — so a body line can never be
+> mistaken for a boundary. Bodies likewise reject **C0 control bytes except tab**:
+> tab is the one C0 byte that is ordinary text (Makefiles require it, gofmt'd Go is
+> tab-indented, and pasted snippets are exactly what a `d` note holds), every channel
+> above passes it untouched, and it breaks neither grammar nor records (bodies are
+> the final field, never split). Newline has its `\` representation (§4.1); the
+> genuinely channel-hostile bytes (NUL, escape, RS/GS, …) stay banned. Tab in *path*
+> fields still percent-encodes as C0 (§8.3). Silent tab→space conversion was
+> rejected: it would corrupt the pasted snippet (a Makefile line copied back out
+> would be syntactically wrong), against the never-silently-altered principle.
 
 ```
 ▸r:api/handler.rb
@@ -389,9 +375,8 @@ rest is raw content; `◾` closes the stream.
 Write acks are one line: `+ #handle created`, `✓ #handle superseded (rev N)`,
 `✓ #handle tombstoned`, `✓ #handle feedback +`, or `✗ #handle <error>`. An `a`
 landing on a node already carrying many visible notes appends the crowding nudge
-(2026-07-21, Q4, §9.6) to its ack — `+ #b41f02 created · node has 9 notes, consider
-folding with u` — still one line, never an error; the threshold is an implementation
-constant tuned in the pilot.
+(§9.6) to its ack — `+ #b41f02 created · node has 9 notes, consider folding with
+u` — still one line, never an error.
 
 > **Decision:** use the Unicode structure glyphs (`→` link, `↑` parent, `←`
 > linked-from, `★` arch, `⚠` stale) — visually unambiguous and collision-proof against
@@ -438,7 +423,7 @@ worth a token.
 See a collapsed line → `r:#handle`. Whether it is a truncated note, a parent arch
 note, or a concept, it is one verb.
 
-> **Decision — handles respect visibility (2026-07-19).** Every handle-addressed
+> **Decision — handles respect visibility.** Every handle-addressed
 > command resolves against the current checkout's **visible set** (visible, stale,
 > unconfirmed — §2). A **pending-elsewhere** entry is indistinguishable from a
 > nonexistent one: `r:#handle` errors `✗ #a3f9c1 unknown`, `s` never matches it, and
@@ -479,27 +464,23 @@ OR-group has all its `+`-joined terms present.
 > **Decision:** `AND` (`+`) is in for v1, as above. **Whole-store search** (`s::term`
 > across everything, ignoring context scope) was dropped under the companion model;
 > the single global store makes it cheap to express, but it is **deferred**
-> (2026-07-20, Q14 → §15). For v1, `s` is context-scoped.
+> (§15). For v1, `s` is context-scoped.
 
 ### 5.6 Ranking
 When more fits than the budget allows, order by **proximity** (closer ancestors first)
-→ **flag state** (unflagged before ⚠-flagged; added 2026-07-21, Q4) → **subject
-priority** (arch first for orientation). That is the whole v1 ranking — three keys,
-fully deterministic, no tuning.
+→ **flag state** (unflagged before ⚠-flagged) → **subject priority** (arch first for
+orientation). That is the whole v1 ranking — three keys, fully deterministic, no
+tuning. Flagged entries (⚠stale · ⚠disputed · ⚠unconfirmed · ⚠split) sink below
+unflagged ones **within their proximity group**; subject priority still orders inside
+each band. Readers see healthy notes first regardless of store debt — part of the
+soft-pressure package (§9.6).
 
-> **Decision:** v1 ranks on **proximity then subject priority only** — amended
-> 2026-07-21 by the binary flag demotion below. Recency and the usage-stat signals
-> (expansion rate, usefulness ratio) are *collected* (§7) but kept **out of the
-> ranking** until there's data to weight them against — a scoring function with
-> weights is deferred (§15) rather than guessed now.
->
-> **Amendment — flag demotion (2026-07-21, part of Q4).** Flagged entries (⚠stale ·
-> ⚠disputed · ⚠unconfirmed · ⚠split) sink below unflagged ones **within their proximity
-> group**; subject priority still orders inside each band. A flag is binary, so this
-> is a third deterministic sort key, not a scoring function — the weighted-score
-> deferral above stands, and usage-signal demotion stays with it (§15). Readers see
-> healthy notes first regardless of store debt; part of the Q4 soft-pressure
-> package (§9.6).
+> **Decision:** a flag is binary, so demotion is a
+> third deterministic sort key, not a scoring function. Recency and the usage-stat
+> signals (expansion rate, usefulness ratio) are *collected* (§7) but kept **out of
+> the ranking** until there's data to weight them against — a weighted scoring
+> function is deferred (§15) rather than guessed now, and usage-signal demotion
+> stays with it.
 
 ---
 
@@ -547,7 +528,7 @@ act on worklisted orphans. Folders are recursive. `rm:path` tombstones every ent
 homed at a path (recursive for folders): the node-level counterpart to `d:#handle`,
 for paths whose knowledge is genuinely gone. Both remain ordinary batch commands.
 
-> **Decision — `mv`/`rm` are write-time macros (2026-07-21, resolves Q7).** Neither
+> **Decision — `mv`/`rm` are write-time macros.** Neither
 > verb has a record type of its own; both expand at write time into records that
 > already exist. `mv:old:new` appends one `RA` per **visible** entry homed at `old`
 > (recursive for folders): file notes get a fresh anchor — `git hash-object` of the
@@ -573,7 +554,7 @@ the cost is accepted in exchange for stats that can rank *and* are shared. Stat
 deltas accumulate in pending and ride the next `dm sync` (§8.4) — a read-only session
 creates no obligation and loses nothing by not syncing. Explicit feedback rides the
 record log as `FB` records (§7.3). The stats' physical home is **one stats file per
-replica** in the store tree (`stats/<replica-id>` — resolved 2026-07-20, Q6, §8.1):
+replica** in the store tree (`stats/<replica-id>`, §8.1):
 each replica writes only its own file, so union is conflict-free and
 max-per-replica is trivial.
 
@@ -662,7 +643,7 @@ memoized query result (verdicts, §9.4) or a disposable cache.
 
 ### 8.1 The store — one metadata branch
 
-> **Decision (2026-07-19):** one shared metadata branch, **`refs/dm/store`**, chosen
+> **Decision:** one shared metadata branch, **`refs/dm/store`**, chosen
 > over git-bug-style per-note operation DAGs: one ref beats thousands (simpler sync,
 > compaction, and forge story), at the price of keeping the wall-clock caveat on
 > ULID-ordered LWW folds — mitigable later via Lamport counters in the record headers
@@ -680,7 +661,7 @@ memoized query result (verdicts, §9.4) or a disposable cache.
   `refs/heads/dm-store` branch is the fallback if a forge misbehaves (forks copy only
   heads and tags).
 
-> **Decision — store tree layout (2026-07-20, resolves Q6).** Three top-level dirs
+> **Decision — store tree layout.** Three top-level dirs
 > plus one marker file:
 >
 > ```
@@ -688,7 +669,7 @@ memoized query result (verdicts, §9.4) or a disposable cache.
 >                          # 4 chars (≈12-day ULID-time windows)
 > stats/<replica-id>       # one file per replica: "<entry-id> i:<n> x:<n> h:<n> t:<ms>" rows
 > blobs/<2ch>/<38ch>       # anchored blobs, content-addressed like git's odb
-> epoch                    # compaction generation counter (§8.7; added 2026-07-21, Q8)
+> epoch                    # compaction generation counter (§8.7)
 > ```
 >
 > - **Records** shard by time prefix so tree objects stay small and old shards
@@ -700,7 +681,7 @@ memoized query result (verdicts, §9.4) or a disposable cache.
 >   Chosen over per-entry-per-replica files (entries × replicas file explosion) and
 >   over stat-increment records (every impression would append forever — the
 >   register file *is* the compacted form). Cadence: deltas accumulate in
->   `.git/.dm/pending/stats` under the Q13 lock; `dm sync` folds them in (add
+>   `.git/.dm/pending/stats` under the invocation lock (§8.2); `dm sync` folds them in (add
 >   counters, max `t`); reads merge store + pending accumulator.
 > - **Blobs** — at `a`/`u`/`k` time, an anchored blob the odb doesn't already have
 >   (truly uncommitted content) is staged to `.git/.dm/pending/blobs/<sha>` —
@@ -720,7 +701,7 @@ memoized query result (verdicts, §9.4) or a disposable cache.
   answer on any clone, so there is no resolved-state to replicate, corrupt, or
   migrate.
 
-> **Decision — cache mechanism (2026-07-20, resolves Q11).** Content-keyed,
+> **Decision — cache mechanism.** Content-keyed,
 > **immutable** cache files, stdlib-only — no embedded database: the cache is
 > write-once/read-many (rebuilt wholesale, never mutated in place), which is exactly
 > the case where a KV store's transactional mutation buys nothing. The **store
@@ -733,14 +714,14 @@ memoized query result (verdicts, §9.4) or a disposable cache.
 > one full scan, and non-matching files are GC'd opportunistically. Files are built
 > in a temp file and renamed into place: atomic, and race-safe without locks —
 > concurrent rebuilds produce byte-identical content, so last-rename-wins is
-> harmless (Q13 concerns pending only). A versioned header (magic + format version)
+> harmless (the invocation lock below concerns pending only). A versioned header (magic + format version)
 > guards format changes; any mismatch or parse error → delete and rebuild. Format:
 > length-prefixed binary (`encoding/binary`; the fields are mostly fixed-width
 > ULIDs/SHAs), loaded wholesale into maps per invocation — ~1–2 MB at 10k entries,
 > single-digit milliseconds, amortized across the batch. **Pending is never
 > indexed**: it is scanned linearly, per-session small by construction. Similarity
 > memos follow the same pattern (`match-<origin>-<checkout-tree>`). Pre-paid upgrade
-> paths if Q2 profiling demands them: mmap'd sorted fixed-width arrays (git
+> paths if profiling (Q2, §14) demands them: mmap'd sorted fixed-width arrays (git
 > pack-`.idx` style) and incremental chaining from the prior index (the store is
 > append-only under union merge, so a new tip's record set is a superset).
 
@@ -749,7 +730,7 @@ invisible to `git status` with no exclude entry, and it is per-clone, shared acr
 all code worktrees. There is no checkout binding and nothing to keep aligned — `dm`
 serves whatever HEAD and working tree it finds.
 
-> **Decision — intra-clone locking (2026-07-20, resolves Q13).** One advisory
+> **Decision — intra-clone locking.** One advisory
 > exclusive lock, `.git/.dm/lock`, taken **for the duration of every invocation** —
 > reads write too (stat deltas, verdicts), so a shared/read mode isn't worth having.
 > `flock(2)`-style locking (`LockFileEx` on Windows), not an `O_EXCL` sentinel file:
@@ -780,7 +761,7 @@ type-specific, body last:
 - `VD <rec-id> <origin-commit> <verdict> [<landed-as>]` — memoized rule-(b) verdict
   (§9.4): `landed <commit>` or `abandoned`; fold rule in §9.4.
 
-> **Decision — id fields hold full ULIDs (2026-07-20, resolves Q10).** Every
+> **Decision — id fields hold full ULIDs.** Every
 > id-valued field above (`<entry-id>`, `<from-id>`, `<to-id>`) holds the **full
 > 26-char entry-id ULID**, and stat rows key on the same (§7.2). Handles never
 > appear in stored records: they are a surface affordance, resolved to entry-ids at
@@ -789,7 +770,7 @@ type-specific, body last:
 
 There is **no `MV` record type**: the companion model's redirect-map machinery is
 gone — moves are *derived* at read time (§9.1–§9.3), and the manual `mv`/`rm` verbs
-are write-time macros over `RA`/`TB` (decision in §6.5, resolves Q7).
+are write-time macros over `RA`/`TB` (§6.5).
 
 > **Decision — serialization.** Fields are separated by a **single space** (never
 > cosmetic alignment padding). Every record's fixed fields come first; the parser
@@ -797,13 +778,12 @@ are write-time macros over `RA`/`TB` (decision in §6.5, resolves Q7).
 > same "body is the trailing field" rule as stdin (§4.1). Therefore `:`, spaces, and
 > backticks inside a body need **no escaping**. Multi-line bodies use the same
 > trailing-`\` continuation as stdin; the only escape is a literal trailing
-> backslash, doubled `\\`. **Path fields (2026-07-20, resolves Q6's encoding half /
-> review nit E3):** path-valued fixed fields (`<path>`, folder anchors) are
-> **canonically percent-encoded** — exactly `%` → `%25`, `:` → `%3A`, space →
-> `%20`, and C0 bytes → `%XX`; every other byte raw. (`%3A` joined the set
-> 2026-07-21 with E3's grammar half: records themselves never split on `:`, but
+> backslash, doubled `\\`. **Path fields:**
+> path-valued fixed fields (`<path>`, folder anchors) are **canonically
+> percent-encoded** — exactly `%` → `%25`, `:` → `%3A`, space → `%20`, and C0
+> bytes → `%XX`; every other byte raw. Records themselves never split on `:`, but
 > this is the one canon shared by record fields, CLI path fields, and all `dm`
-> output — §4.1.) Canonical (always this set, never more) is load-bearing: union
+> output (§4.1). Canonical (always this set, never more) is load-bearing: union
 > dedup is byte-identity, so any path must have exactly one encoding. Bodies are
 > untouched (body-last).
 
@@ -821,7 +801,7 @@ are write-time macros over `RA`/`TB` (decision in §6.5, resolves Q7).
 
 Two refinements make the order trustworthy:
 
-- **Monotonic minting — rec-ids only (2026-07-20, resolves Q9).** `dm` mints
+- **Monotonic minting — rec-ids only.** `dm` mints
   **rec-ids** in the spec's *monotonic mode* per process: within the same
   millisecond, each successive id increments the previous random tail instead of
   re-rolling it. This guarantees a batch's records order as written — an `a`
@@ -842,8 +822,8 @@ LWW outcome is reproducible (§11).
 **Decision — write-time anchoring** (replaces the companion model's stamp-at-commit).
 Anchors are stamped **at write time** from the working tree — `git hash-object` of
 the file exactly as the agent sees it. No placeholder, no later stamping pass, no
-window in which a note asserts freshness against bytes it never described (this is
-what dissolved review finding A5). The current anchor folds as a **LWW register**
+window in which a note asserts freshness against bytes it never described (this
+closes the companion model's stamping-window flaw, §13). The current anchor folds as a **LWW register**
 from the entry's `CR`/`SU`/`RA` records (largest `<rec-id>`). It is re-stamped
 **only** by a deliberate write — `a`, `u`, or `k` — never by sync, which would
 re-bless a note as fresh without anyone confirming it still matches the code.
@@ -880,11 +860,11 @@ Properties:
 - **Convergence is eventual, not immediate** — two clones can transiently disagree on
   rule (b) when one has fetched an origin commit the other lacks, until the first
   memoized verdict record lands in the store (§9.4).
-- **Ends with a health line** (added 2026-07-21, Q4) — one summary line of worklist
+- **Ends with a health line** — one summary line of worklist
   counts, session-scoped then global (`3 stale · 1 orphaned near your work · 41
   elsewhere`): the backlog is surfaced at every share point, never demanded (§9.6).
 
-> **Decision — epoch rule and push-clears-pending (2026-07-21, part of Q8).** Naive
+> **Decision — epoch rule and push-clears-pending.** Naive
 > set-union cannot unlearn: a compacted-away record would be re-added by the first
 > sync from any replica still holding the old tree. Two amendments make removal
 > stick:
@@ -935,7 +915,7 @@ except pending, which is by definition not yet shared.
 - **Store growth**: anchored blobs ride in the store tree; overhead is only truly
   uncommitted content (§8.1). Reclaimed by `dm gc` (§8.7).
 - **No forcing function for hygiene**: the worklist replaces the companion model's
-  hard gate; pressure is supplied by the Q4 soft layers (§9.6), never by a gate.
+  hard gate; pressure is supplied by the soft-pressure layers (§9.6), never by a gate.
 
 ### 8.5 Replica identity
 G-Counters need a stable per-clone **replica id**, kept in `.git/.dm/replica` (one
@@ -1000,7 +980,7 @@ read.
 
 ### 8.7 Compaction — `dm gc`
 
-> **Decision (2026-07-21, resolves Q8).** The store's *history* carries no
+> **Decision.** The store's *history* carries no
 > information — records are self-timestamped, only the tip tree is data — so
 > compaction is an **orphan re-commit** of a slimmed tip tree with `epoch` bumped
 > by one, pushed under the same non-ff fetch-retry loop as sync. Any replica may
@@ -1166,15 +1146,15 @@ described → follow with an unconfirmed flag regardless of vote strength; **emp
 folders** — git cannot represent them, so a folder containing no files has nothing
 to diff (inherent limit).
 
-> **Decision — split/absorbed UX (2026-07-21, resolves Q3).** Three parts:
+> **Decision — split/absorbed UX.** Three parts:
 >
 > 1. **Splits surface at every candidate, flagged.** While ambiguous, the note
 >    appears as a parent note for reads under *each* candidate prefix, marked
 >    `⚠split` and demoted like every flag (§5.6). It is wrong at one candidate by
 >    construction, but the flag states exactly that uncertainty — and the readers
 >    under the candidates are the only agents with the context to resolve it, at
->    the moment they have it. Worklist-only surfacing was rejected: under the Q4
->    soft-pressure model an invisible split could stay unresolved indefinitely.
+>    the moment they have it. Worklist-only surfacing was rejected: under the
+>    soft-pressure model (§9.6) an invisible split could stay unresolved indefinitely.
 >    **Scatter** — no candidate at all — is worklist-only by necessity.
 > 2. **Evidence rides the worklist and the drill, not the surface.** Surfaces show
 >    only the flag; `dm worklist` and `r:#handle` show the vote so judgment is
@@ -1185,8 +1165,8 @@ to diff (inherent limit).
 > 3. **`k` gains an optional explicit target** — `k:#h:api-core/` re-homes *this
 >    entry* to the named candidate: the same `RA` record as plain `k`, which keeps
 >    meaning "bless dm's guess" (the absorbed/unconfirmed case). The path is the
->    final field, so `:` in it needs no escaping (Q6 rule). `mv` stays purely
->    path-level (Q7); it cannot express per-entry choices, which mixed splits need.
+>    final field, so `:` in it needs no escaping (§4.1). `mv` stays purely
+>    path-level (§6.5); it cannot express per-entry choices, which mixed splits need.
 >    A note that genuinely applies to both halves: `k` it to one home and write a
 >    fresh `a` at the other (optionally `al`-linked) — no duplication machinery in
 >    v1.
@@ -1259,11 +1239,11 @@ reads; nothing demands tombstones, so skew or an odd checkout can never pressure
 agent into destroying live knowledge. What supplies the pressure instead is the
 layered soft-pressure package below.
 
-> **Decision — layered soft pressure, no gate (2026-07-21, resolves Q4).** Nothing
+> **Decision — layered soft pressure, no gate.** Nothing
 > ever *forces* hygiene: a hard gate is a destructive-compliance machine and stays
 > rejected, as does auto-decay/TTL (destructive expiry violates
 > never-silently-destroyed; non-destructive expiry silently hides cold-but-valid
-> knowledge — the Q14 recall case). Pressure instead rides moments where the agent
+> knowledge — the recall case behind whole-store search, §15). Pressure instead rides moments where the agent
 > already has the context to act, in four layers:
 >
 > 1. **Flag demotion in ranking** (§5.6) — ⚠-flagged entries sink below unflagged
@@ -1272,6 +1252,7 @@ layered soft-pressure package below.
 > 2. **Crowding nudge** (§4.3) — an `a` ack on a node already carrying many visible
 >    notes appends a one-line hint to fold with `u`/`d`. Slop is caught at write
 >    time, when the writer has just read the node's surface and knows what overlaps.
+>    The threshold is an implementation constant tuned in the pilot.
 > 3. **Scoped worklist** — the default listing is bounded and context-scoped: it
 >    leads with items homed on or near paths this replica's session has read or
 >    written (derived from the pending records and the pending stat accumulator — no
@@ -1282,12 +1263,12 @@ layered soft-pressure package below.
 >    session-scoped then global. The backlog is never invisible.
 >
 > Every layer converts a global, someday chore into a local, now, in-context one —
-> but none guarantees the global backlog shrinks. That residual is review finding D1
-> (agent discipline alone preventing a slop spiral is the design's biggest
-> unvalidated premise), so it is instrumented rather than assumed: the Q1 pilot
-> additionally tracks **worklist backlog growth, stale fraction, and usefulness
-> ratio**; if the backlog grows without bound under these layers, Q4 reopens with
-> data (§14).
+> but none guarantees the global backlog shrinks. That residual — agent discipline
+> alone preventing a slop spiral — is the design's biggest unvalidated premise
+> ([review](archive/review.md)), so it is instrumented rather than assumed: the Q1
+> pilot additionally tracks **worklist backlog growth, stale fraction, and
+> usefulness ratio**; if the backlog grows without bound under these layers, the
+> decision reopens with data (§14).
 
 Worklist entries are resolved with the ordinary verbs: `k` (re-anchor/re-bless), `u`
 (rewrite), `d` (tombstone), `mv` (manual re-home), `rm` (retire a dead path).
@@ -1402,7 +1383,7 @@ the resulting store state. This is the primary test strategy.
 
 ### 11.2 Fixture repository
 
-> **Decision (2026-07-19) — the fixture is a whole repository, copied per test.**
+> **Decision — the fixture is a whole repository, copied per test.**
 > The well-known-base idea is kept: every scenario starts from an identical,
 > pre-seeded state so it inherits known handles, paths, and stats, and per-scenario
 > setup is one copy, not a long command script. Under the single-store model that
@@ -1414,8 +1395,8 @@ the resulting store state. This is the primary test strategy.
 > duplicates the replica id (§8.5's caveat) — deliberate and harmless here, since
 > fixture replica ids are pinned anyway.
 >
-> **Decision — the builder lives in the test harness, not the binary (2026-07-21,
-> resolves review nit E5).** The fixture is built by a **harness-owned tool**
+> **Decision — the builder lives in the test harness, not the binary.** The
+> fixture is built by a **harness-owned tool**
 > (`cmd/dm-fixture`, built from the same module, never shipped) from a single
 > declarative manifest — code history + notes + seeded stats — so a storage-format
 > change is still absorbed in one place. The builder needs no internal hooks: it
@@ -1465,12 +1446,12 @@ to snapshot sync results; devs use it to inspect what actually landed.
 - **Two-phase** — syntactically bad batch writes nothing; per-command errors
   isolated; `$N` backref violations (forward / out-of-range / non-create) reject
   at parse.
-- **Path escaping** (E3) — `r:foo%3A1` reads the file named `foo:1` while
+- **Path escaping** — `r:foo%3A1` reads the file named `foo:1` while
   `r:foo:1` is a depth-1 read of `foo`; a bare `%` in a path rejects at phase 1
   with the `%25`/`%3A` hint; a body line ending `\\` ends the command with a
   literal backslash while `\` continues it; every path `dm` prints re-parses as
   valid input (canonical round-trip, §4.1/§8.3).
-- **Body bytes** (E2) — a tab-bearing body (Makefile/gofmt snippet) round-trips
+- **Body bytes** — a tab-bearing body (Makefile/gofmt snippet) round-trips
   byte-identically through write, store, and surface; NUL and the other C0 bytes,
   and `▸`/`◾`, still reject with `✗` (§4.3).
 - **Visibility** — replay the §2 file and folder tables **row by row**; the tables
@@ -1479,12 +1460,12 @@ to snapshot sync results; devs use it to inspect what actually landed.
   (§9.3), ambiguity policy, path-hint preference.
 - **Macros** — `mv` expands to per-entry `RA` (rehashed anchors, prefix-rewritten
   folder keys), `rm` to per-entry `TB`; missing destination file → per-entry error,
-  rest of the batch unaffected; recursive folder cases (Q7, §6.5).
-- **Hygiene** (Q4) — flagged entries sink within their proximity group, unflagged
+  rest of the batch unaffected; recursive folder cases (§6.5).
+- **Hygiene** — flagged entries sink within their proximity group, unflagged
   order untouched; the crowding nudge appears exactly at the threshold and never
   errors; worklist leads with session-scoped items and counts the remainder; the
   sync health line matches worklist counts (§9.6).
-- **Split/absorbed UX** (Q3) — a split note surfaces `⚠split` at each candidate and
+- **Split/absorbed UX** — a split note surfaces `⚠split` at each candidate and
   demoted; worklist/drill lines carry vote · margin · coverage; `k:#h:path` re-homes
   one entry while sibling entries stay ambiguous; plain `k` blesses an unconfirmed
   follow; scatter appears only on the worklist (§9.3).
@@ -1499,7 +1480,7 @@ to snapshot sync results; devs use it to inspect what actually landed.
   landed `VD` survives while any record carries its origin; concurrent gc + sync
   race converges; pending survives a lost push race.
 - **Locking** — concurrent invocations serialize on `.git/.dm/lock`; rec-id order
-  survives a same-millisecond process handoff (Q13, §8.2).
+  survives a same-millisecond process handoff (§8.2).
 - **Determinism** — same records, different sync orders/replicas → identical folded
   state.
 - **Guard** — the fixture build commands (`a`, seed path) produce the expected base.
@@ -1523,55 +1504,48 @@ to snapshot sync results; devs use it to inspect what actually landed.
 
 ## 13. Rejected — Companion-Branch Mirroring
 
-Until 2026-07-19 this document specified a different architecture: every code branch
-`B` had a **companion branch** `llm/<B>` whose tree mirrored the code's directory
-structure and carried the notes, held in dm-managed worktrees under `.git/.dm/`,
-driven by an explicit verb choreography (`dm checkout` / `merge` / `commit` / `push`
-/ `fetch` / `unmerged` / `prune`) that the agent ran alongside each git operation —
-plus a hard `dm pre-commit` gate forcing orphan/staleness reconciliation before
-every shadow commit, and patch-id detection to recognize branches landed by hosted
-rebase/squash buttons.
+This document originally specified a **companion branch** `llm/<B>` per code
+branch, mirroring the code's tree and carrying its notes in dm-managed worktrees,
+driven by an explicit verb choreography the agent ran alongside each git operation,
+with a hard pre-commit reconciliation gate. Adversarial review
+([review.md](archive/review.md)) found the storage core sound but produced four
+critical findings — a gate that destroys live knowledge under tree skew, cross-clone
+companion divergence with no merge path, an alignment-check/content-dirt deadlock,
+and a stamping window that silently blessed drifted anchors — all tracing to one
+stance: **dm sitting outside git, mirroring branch topology and trying to observe
+git events after the fact.**
 
-**Why it was rejected.** Adversarial review ([review.md](archive/review.md)) found the
-storage core sound but produced four critical findings — **A1** (the orphan hard
-gate destroys live knowledge under tree skew), **A3** (same-companion divergence
-across clones has no merge path), **A4** (alignment-check/content-dirt deadlock),
-**A5** (within-session anchor drift silently blessed at commit-stamping time) — that
-all trace to one architectural stance: **dm sitting outside git, mirroring branch
-topology and trying to observe git events after the fact.** A patch package (a
-`Dm-Code` binding trailer plus recorder hooks) was designed and judged to be
-stabilizing machinery for an unstable stance. The adopted model deletes the problems
-instead of patching them: content + origin anchoring makes visibility a pure
-read-time query (§2, §9), so there is no topology to mirror, no fold to choreograph,
-no gate that can destroy data (A1 → a never-destructive worklist, §9.6), one CRDT
-store with a sync retry loop (A3 → §8.4), no checkout binding to misalign (A4 →
-nothing to align), and write-time anchoring (A5 → no stamping window, §8.3). It also
+The adopted model deletes the problems instead of patching them — visibility is a
+pure read-time query (§2, §9): no topology to mirror, no gate that can destroy data
+(→ the never-destructive worklist, §9.6), one union-merged store with a sync retry
+loop (§8.4), no checkout binding to misalign, no stamping window (§8.3) — and it
 needs none of the sync mechanisms surveyed in
-[existing_git_branch_follow_strategies.md](existing_git_branch_follow_strategies.md)
-— nothing observes git; queries just look.
-
-**What survived** is everything the review found sound: the append-only record/CRDT
-layer (§8.3), handles (§3.5), the batch CLI (§4), and progressive disclosure (§5).
-The spike that developed the adopted model is preserved in
-[spike_content_adressable.md](archive/spike_content_adressable.md); the fallback, had it
-failed validation, was the trailer + recorder-hooks package on companions.
+[existing_git_branch_follow_strategies.md](existing_git_branch_follow_strategies.md):
+nothing observes git; queries just look. What survived is everything the review
+found sound: the append-only record/CRDT layer (§8.3), handles (§3.5), the batch
+CLI (§4), progressive disclosure (§5). The spike that developed the adopted model
+is preserved in
+[spike_content_adressable.md](archive/spike_content_adressable.md); the fallback,
+had validation failed, was a binding-trailer + recorder-hooks package on
+companions.
 
 ---
 
 ## 14. Open Questions — build-time validation gates
 
 The questions once tracked here (Q3–Q14) are settled; each decision lives as a
-dated decision block in its home section — Q3 §9.3 · Q4 §9.6 · Q5 §2.1 ·
+decision block in its home section. The historical ids — used by the archived
+[review](archive/review.md) and plan — map as: Q3 §9.3 · Q4 §9.6 · Q5 §2.1 ·
 Q6 §8.1/§8.3 · Q7 §6.5 · Q8 §8.7 · Q9 §3.5 · Q10 §8.3 · Q11 §8.2 · Q12 §4.2 ·
-Q13 §8.2 · Q14 §15. What remains is empirical: two gates that can only be verified
-with v1 built, both running on the §11.4 harness.
+Q13 §8.2 · Q14 §15. What remains is empirical: two gates (Q1, Q2) that can only be
+verified with v1 built, both running on the §11.4 harness.
 
 - **Q1 — does resolution follow ordinary edit churn?** The premise to verify: that
   everyday editing rarely drops notes to layer 4 (unresolved) of §9.1 — if it
   routinely does, the model fails regardless of the merge story. Rig: replay a real
   repo's history against seeded notes (§11.4) and measure the fraction resolving
   via layers 1–3. The same runs calibrate the acceptance-band fractions (§9.2,
-  §9.3) and track the Q4 hygiene metrics — worklist backlog growth, stale
+  §9.3) and track the hygiene metrics (§9.6) — worklist backlog growth, stale
   fraction, usefulness ratio (§9.6).
 - **Q2 — read-path performance on large repos.** The caches (§8.2) and verdict
   records (§9.4) reduce steady-state reads to an index load plus tree lookups;
@@ -1597,7 +1571,7 @@ with v1 built, both running on the §11.4 harness.
   (§5.6); folding staleness, recency, and usage signals (expansion rate, usefulness
   ratio, feedback) into a weighted score waits until there's real usage data to tune
   the weights against.
-- **bisect mode** (Q5) — an opt-in read mode (flag or config) relaxing rule (b) at
+- **bisect mode** — an opt-in read mode (flag or config) relaxing rule (b) at
   detached old checkouts so later-on-main knowledge about *unchanged* files (rule
   (a) still holds) surfaces during bisect; v1 stays strict (§2.1).
 - **auto-triggered compaction** — v1 compaction is manual `dm gc` only (§8.7);
@@ -1609,7 +1583,7 @@ with v1 built, both running on the §11.4 harness.
 - **team-shared vs per-clone stats** — already merged via CRDT counters; revisit if
   per-clone granularity turns out to matter.
 - **duplicate signal** — none for v1; agent cleans up via CRUD (§6.3).
-- **whole-store search** (`s::term`, Q14) — "what do I know about deploys?" has no
+- **whole-store search** (`s::term`) — "what do I know about deploys?" has no
   verb in v1; `s` stays context-scoped (§5.5). The single global store makes it
   cheap to add when the need is demonstrated.
 - **oversized-entry pagination** — expansion returns full body for v1; paginate huge
@@ -1617,9 +1591,3 @@ with v1 built, both running on the §11.4 harness.
 - **extensible subjects** — fixed c/a/d/o enum for v1 (§3.3).
 - **"occupant changed" flag for folder notes** — a possible softening of the
   exact-path-wins rows 13/14 (§2.2); accepted as-is for v1.
-- **hunk-level following** — out, not deferred (§9.5): line ranges rot; whole-file
-  blob identity is the 90% solution. Listed so the known ceiling is on the record.
-- **staleness fidelity** — *not* deferred; settled as an **accepted limitation**
-  (§9.5): blob drift detects byte-change, not wrongness, so false
-  positives/negatives exist and are lived with. Listed here only so the known gap is
-  on the record.
