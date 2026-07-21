@@ -38,8 +38,8 @@ agent accumulates and wants back later, in the right context, without re-derivin
 - **Anchor** — the write-time facts binding a note to code. File notes: **content
   key** (blob SHA of the described bytes) + **origin**; folder notes: **path key** +
   origin (§3.1).
-- **Origin** — the HEAD commit at write time; the lineage half of the visibility rule
-  (§2).
+- **Origin** — the HEAD commit stamped on each record at write time; the lineage
+  half of the visibility rule (§2), applied per record (§8.3).
 - **Node** — an addressable location notes resolve to: a file or folder of the
   current checkout.
 - **Logical entry** — one note. Has a stable id, a subject, a body, links, and a
@@ -58,8 +58,8 @@ agent accumulates and wants back later, in the right context, without re-derivin
   development / operations (§3.3).
 - **LWW register** — a single-valued field merged **last-write-wins** under a
   deterministic total order: the `t` stat register by max timestamp, record-log
-  fields (current body, anchor) by winning `<rec-id>` ULID (§8.3). Everything else
-  in the stats is a set/counter that unions.
+  fields (current body, anchor, path hint) by winning `<rec-id>` ULID (§8.3).
+  Everything else in the stats is a set/counter that unions.
 
 ---
 
@@ -74,6 +74,9 @@ them row by row.
 **Visibility rule**: a note is visible iff **(a)** the working tree contains the
 content it describes **AND (b)** the note's origin line is part of the current
 checkout's lineage — written on this line, or on a line that has since merged into it.
+Origins are per *record*: each revision, confirmation, or move applies where its
+own line has landed (row 16, §8.3), so "the note" here means the state this
+checkout folds.
 (b) is a deliberate isolation choice: a file-specific note may only make sense in the
 changed context of its branch, so content presence alone is not sufficient. "On branch
 B" below is shorthand for "the checked-out tree has B's content"; branch *names* carry
@@ -96,6 +99,7 @@ no visibility semantics.
 | 13 | branch B deleted *without* merging | B-only notes stop being visible anywhere; they appear on the worklist as "abandoned," distinguishable from "pending on an unmerged branch" |
 | 14 | teammate clones/pulls the same state | sees exactly the same notes with the same flags — visibility is a pure function of tree state + lineage, not of who wrote what where |
 | 15 | detached HEAD / bisect at an old commit | notes whose content is present *and* whose origin line had landed as of that commit are visible; later notes are not — same rule, no special-casing |
+| 16 | visible note superseded / confirmed / moved on main; branch B unmerged | B still reads **its lineage's newest state** — the prior body, anchor, and path; main's revision applies on B only once main lands there. Symmetric: B's revisions stay invisible on main until B lands (per-record fold, §8.3) |
 
 **Note states**: every note is in exactly one of five states per checkout —
 **visible** · **stale** (visible, flagged: content drifted, needs re-confirmation) ·
@@ -439,8 +443,11 @@ note, or a concept, it is one verb.
 > unconfirmed — §2). A **pending-elsewhere** entry is indistinguishable from a
 > nonexistent one: `r:#handle` errors `✗ #a3f9c1 unknown`, `s` never matches it, and
 > `al`/`dl` refuse it — its notes appear the moment the origin lands, as if newly
-> created. (On degraded clones, **unknown**-classified origins — §9.4 — behave
-> identically to pending-elsewhere.) The worklist states (**abandoned**, **orphaned**) likewise never surface
+> created. The same principle applies *within* an entry: a revision,
+> confirmation, or move made on an unlanded line is invisible here — the
+> checkout folds the entry from its landed records only (§8.3) — and applies
+> the moment that line lands. (On degraded clones, **unknown**-classified
+> origins — §9.4 — behave identically to pending-elsewhere.) The worklist states (**abandoned**, **orphaned**) likewise never surface
 > in reads, search, or link expansion, but they *are* addressable by the repair verbs
 > `k`/`u`/`d` (and `mv`/`rm`) from the worklist (§9.6) — that is how an orphan is
 > re-homed or retired without ever being silently destroyed.
@@ -540,21 +547,31 @@ act on worklisted orphans. Folders are recursive. `rm:path` tombstones every ent
 homed at a path (recursive for folders): the node-level counterpart to `d:#handle`,
 for paths whose knowledge is genuinely gone. Both remain ordinary batch commands.
 
-> **Decision — `mv`/`rm` are write-time macros.** Neither
-> verb has a record type of its own; both expand at write time into records that
-> already exist. `mv:old:new` appends one `RA` per **visible** entry homed at `old`
-> (recursive for folders): file notes get a fresh anchor — `git hash-object` of the
-> working-tree file at the mapped destination, origin = HEAD now — so the entry is
-> re-stamped to current reality; folder notes get their path-key anchor rewritten by
-> prefix substitution. If the destination file is absent from the working tree, that
-> expansion fails as a **per-entry error** in batch output (`mv` describes a move
-> that happened; it does not invent one). `rm:path` expands to one `TB` per visible
-> entry, recursive likewise. Entries not yet visible (e.g. pending on an unmerged
-> branch) are untouched — when they land they surface as residue and get their own
-> fix; that is the uniform drift path, not a gap. Path-scoped redirect records were
-> rejected: redirects are rules that outlive their evidence (chaining, cycles,
-> precedence against automatic resolution, landmines for future entries at reused
-> paths) — the same redirect-map machinery §13 already discarded.
+> **Decision — `mv` relocates, never blesses; both verbs are write-time macros.**
+> `mv:old:new` appends one **`RP` (re-path, §8.3)** record per **visible** entry
+> homed at `old` (recursive for folders): a new path hint plus a scoping origin
+> (HEAD — the line on which the move was observed; per-record rule (b), §8.3);
+> the entry's content anchor is untouched. Consequences, each deliberate:
+> `⚠stale` keeps measuring the bytes the note actually described, so a bulk
+> folder `mv` relocates without silently re-blessing anything (§8.3's
+> confirming-write principle applied to moves); `⚠disputed` survives (`RP` is
+> outside the §7.3 dispute rule — a relocation is not a resolution); and sibling
+> branches are untouched — they fold without the `RP` until the move's line
+> lands there, so the hint can never mislead a line where the move hasn't
+> happened. For folder notes the path *is* the anchor, so
+> the prefix-substituted `RP` is the complete move. Blessing stays with `k`/`u`,
+> per note. A below-threshold move needs the pinned resolution layer (§9.1) to
+> surface at the destination; if the destination file is absent from the working
+> tree, the expansion fails as a **per-entry error** in batch output (`mv`
+> describes a move that happened; it does not invent one). `rm:path` expands to
+> one `TB` per visible entry, recursive likewise. Entries not yet visible (e.g.
+> pending on an unmerged branch) are untouched — when they land they surface as
+> residue and get their own fix; that is the uniform drift path, not a gap.
+> Path-scoped redirect records stay rejected: redirects are rules that outlive
+> their evidence (chaining, cycles, precedence against automatic resolution,
+> landmines for future entries at reused paths) — the same redirect-map machinery
+> §13 already discarded. `RP` is not a redirect: a per-entry fact in the entry's
+> own record log, LWW-folded like any field, with no path-level rule machinery.
 
 ---
 
@@ -585,9 +602,9 @@ click. Two more distinctions: **expansions** (`x`) is a *count* (how often opene
 while **last-expanded** (`t`) is a *timestamp* (how recently) — frequency vs recency,
 both needed for ranking. And **revisions / churn** is **derived from the record log**,
 not a stored counter: it is the count of `SU` records on the entry (`CR` = rev 1,
-each `SU` +1). `RA` and `TB` are *not* revisions — only `SU` — so re-anchoring via
-`k` never inflates churn, and because it folds from the unioned log it can't
-double-count on sync.
+each `SU` +1). `RA`, `RP`, and `TB` are *not* revisions — only `SU` — so
+re-anchoring via `k` (or relocating via `mv`) never inflates churn, and because it
+folds from the unioned log it can't double-count on sync.
 
 > **Decision:** `search-hits` is a **distinct counter**, bumped when `s` surfaces an
 > entry as a match — *not* folded into impressions, and with **no attempt to
@@ -626,10 +643,12 @@ editor (`f:#f22e90:!:repo/ layer was removed in v3`). Feedback is a **log record
 (`FB`, §8.3), not a counter: it carries the reason, unions like every other record,
 and rides pending → sync like content. The per-entry `+`/`-`/`!` tallies are
 *derived* by folding `FB` records, like churn. `⚠disputed` is defined as an `FB !`
-record **newer (rec-id order) than the entry's latest `SU`/`RA`** — so a dispute is
+record **newer (rec-id order) than the checkout's latest landed `SU`/`RA`**
+(per-record fold, §8.3) — so a dispute is
 cleared exactly by the housekeeping resolutions, `u` (rewrite) or `k` (re-bless),
-each of which outranks the old complaint; a still-standing complaint re-flags by
-being re-filed. Implicit signals still count (expansion = weak +, ignore = weak −);
+each of which outranks the old complaint (`RP` — a pure relocation, §6.5 — is
+deliberately outside this rule: moving a disputed note never clears the dispute);
+a still-standing complaint re-flags by being re-filed. Implicit signals still count (expansion = weak +, ignore = weak −);
 `f` is the explicit, high-weight channel.
 
 ### 7.4 How stats feed retrieval & surface flags
@@ -754,8 +773,13 @@ serves whatever HEAD and working tree it finds.
 > reads write too (stat deltas, verdicts), so a shared/read mode isn't worth having.
 > `flock(2)`-style locking (`LockFileEx` on Windows), not an `O_EXCL` sentinel file:
 > the lock dies with the process, so a crash can never leave the git-`index.lock`
-> stale-lock failure mode. Contenders **block** briefly (batches run in
-> milliseconds), then error: `✗ another dm process holds .git/.dm/lock (pid N)`. The
+> stale-lock failure mode. Contenders **wait until the lock frees — they never
+> error** (v1): warm batches run in milliseconds, but a cold read can hold the
+> lock for seconds (Q2, §14), and erroring would push retry loops into every
+> agent; after ~1s of waiting a stderr notice names the holder
+> (`dm: waiting on .git/.dm/lock (held by pid N)`). Serializing a clone's
+> parallel agents is the accepted v1 cost; a shared read mode with per-process
+> stat shards is the pre-paid upgrade (§15). The
 > lock also restores cross-process rec-id order: on acquisition, monotonic minting
 > resumes from the largest rec-id already in pending when the clock hasn't advanced
 > past it, so two serialized same-millisecond processes can never fold out of order.
@@ -773,6 +797,12 @@ type-specific, body last:
   re-stamps the anchors.
 - `TB <rec-id> <entry-id>` — tombstone.
 - `RA <rec-id> <entry-id> <anchor> <origin> <path>` — re-anchor only (§9.5), no body.
+- `RP <rec-id> <entry-id> <origin> <path>` — re-path only (§6.5): a new path
+  hint, scoped by its own origin like every fold-participating record
+  (per-record rule (b) below); the entry's content anchor is untouched. A
+  distinct type because intent is unrecoverable from field values: `k` on an
+  unchanged file writes an `RA` carrying the same anchor bytes, yet must clear
+  disputes — relocate vs. re-bless lives in the type.
 - `LN <rec-id> <from-id> <to-id> [comment]` — link, with optional comment.
 - `UL <rec-id> <from-id> <to-id>` — unlink.
 - `FB <rec-id> <entry-id> <sig> [reason]` — feedback: `sig` ∈ `+`/`-`/`!`, optional
@@ -792,7 +822,7 @@ type-specific, body last:
 
 There is **no `MV` record type**: the companion model's redirect-map machinery is
 gone — moves are *derived* at read time (§9.1–§9.3), and the manual `mv`/`rm` verbs
-are write-time macros over `RA`/`TB` (§6.5).
+are write-time macros over `RP`/`TB` (§6.5).
 
 > **Decision — serialization.** Fields are separated by a **single space** (never
 > cosmetic alignment padding). Every record's fixed fields come first; the parser
@@ -846,16 +876,54 @@ Anchors are stamped **at write time** from the working tree — `git hash-object
 the file exactly as the agent sees it. No placeholder, no later stamping pass, no
 window in which a note asserts freshness against bytes it never described (this
 closes the companion model's stamping-window flaw, §13). The current anchor folds as a **LWW register**
-from the entry's `CR`/`SU`/`RA` records (largest `<rec-id>`). It is re-stamped
-**only** by a deliberate write — `a`, `u`, or `k` — never by sync, which would
-re-bless a note as fresh without anyone confirming it still matches the code.
+from the entry's **landed** `CR`/`SU`/`RA` records — rule (b) applied per record,
+largest `<rec-id>` among those whose origin has landed at the checkout (decision
+below); the path hint folds likewise, with `RP` joining the set (§6.5). The
+anchor is re-stamped **only** by a deliberate confirming write — `a`, `u`, or
+`k`; never `mv`, which relocates without confirming (§6.5) — and never by sync,
+which would re-bless a note as fresh without anyone confirming it still matches
+the code.
+
+**Decision — rule (b) folds per record, not per entry.** Every fold-participating
+record (`CR`/`SU`/`RA`/`RP`) carries its own origin, and a checkout folds an
+entry from **only the records whose origins have landed there** (§9.4), LWW among
+those. A confirmation, rewrite, or move propagates to a line exactly when the
+line that made it lands — the §5.3 "appears as if newly created" principle,
+extended from entries to revisions. Consequences, each deliberate:
+
+- `k` on main cannot retract a note from an unmerged branch: the branch folds
+  without the new `RA`, keeping the state that was true of *its* bytes.
+  Confirming a note never shrinks where it is visible.
+- `k`/`u` on a line that is later abandoned is contained: the record's origin
+  dies with that line; every other line keeps folding the prior state. A truly
+  abandoned entry (no landed record anywhere) is still rescuable from the
+  worklist — `k` mints an `RA` with a live origin.
+- After a mainline `u`, an unmerged branch reads the *superseded* body — the
+  revision that corresponds to its content — rather than nothing; the new
+  revision arrives when main lands there.
+- Each `RA`'s origin tree contains that `RA`'s anchor, so §9.2's two-point
+  invariant holds per record and folder fingerprints stay fresh.
+
+`TB` stays global — it carries no origin and is absorbing everywhere (tombstone
+decision below). `FB`/`LN`/`UL` stay global too: a complaint or link travels
+wherever the entry is visible; that a mainline `FB !` can flag an older,
+still-current-on-a-branch revision is accepted for v1. Entry-level states derive
+from the best record-level state — any record landed → present here; else any
+origin reachable from another ref → pending-elsewhere; else abandoned (§9.4).
+Cost: rule (b) classifications run per fold-participating record rather than per
+entry — entries carry a handful, ancestry checks are cheap under commit-graph,
+and the verdict/unreachability machinery (§9.4, §8.2) applies unchanged per
+origin.
 
 **Decision — concurrent supersede.** When two replicas supersede the same entry
 concurrently, the current body resolves **last-write-wins** by the winning `SU`
-record's `<rec-id>` (the ULID total order above), consistent with anchor resolution.
-Both `SU` records survive in the log — the loser becomes a sibling revision, never a
-conflict — so nothing is destroyed and churn stats stay accurate. No keep-both fork
-is surfaced; the fold always yields one clean current body.
+record's `<rec-id>` (the ULID total order above), consistent with anchor
+resolution — evaluated per checkout over the *landed* records (per-record rule
+(b) above), so while the two lines are unmerged each reads its own revision, and
+the first checkout containing both folds them to one winner. Both `SU` records
+survive in the log — the loser becomes a sibling revision, never a conflict — so
+nothing is destroyed and churn stats stay accurate. No keep-both fork is
+surfaced; the fold always yields one clean current body per checkout.
 
 **Decision — tombstone is terminal.** `TB` is absorbing, not a LWW participant: once
 any `TB` record exists for an entry, the entry folds to deleted — a concurrent `SU`
@@ -1011,7 +1079,14 @@ read.
 > **Decision.** The store's *history* carries no
 > information — records are self-timestamped, only the tip tree is data — so
 > compaction is an **orphan re-commit** of a slimmed tip tree with `epoch` bumped
-> by one, pushed under the same non-ff fetch-retry loop as sync. Any replica may
+> by one. An orphan tip is never a fast-forward, so the push is a forced
+> **compare-and-swap** — always `--force-with-lease=refs/dm/store:<fetched-tip>`
+> (explicit expected value), never plain `--force`, which in the
+> fetch→sweep→push window could overwrite a concurrently-landed sync whose
+> pusher has already cleared pending: records that then exist nowhere. A lease
+> rejection re-enters the same fetch → re-sweep → re-push loop as sync's retry.
+> (Sync's own store commits are parented on the fetched tip, so its pushes are
+> plain fast-forwards — sync never forces.) Any replica may
 > run it; there is no coordinator. The trigger is **manual `dm gc` only** (v1); the
 > sweep is a deterministic mark-and-sweep with a canonical tree build, so two
 > concurrent compactors over the same tip produce the same tree SHA and the race
@@ -1028,6 +1103,10 @@ read.
 >   older than **3 months** (rec-id ULID age). Within the window they stay, so the
 >   derived churn count (§7.1) becomes **recency-scoped** — deliberate: recent
 >   churn is the volatility signal; ancient churn on a since-stable note is noise.
+>   Per-record-fold caveat (§8.3): an unmerged line older than the window may
+>   still fold a shadowed revision as *its* current state; after the sweep such
+>   a line reads the entry as pending-elsewhere until it catches up — accepted,
+>   the window bounds exactly this tail.
 > - **Verdicts**: a `VD` is droppable **iff no surviving record's origin field
 >   matches its origin and no surviving `VD`'s landed-as field references it**
 >   (bindings chain, §9.4). Landed verdicts are irreplaceable evidence once the
@@ -1071,7 +1150,18 @@ never stored — they are classifications.
 3. **Edited** — blob absent; similarity-match it against the checkout (§9.2) →
    visible at the matched path, flagged `⚠stale`. Staleness is gradable (similarity
    score) — keep the binary flag for v1.
-4. **Unresolved** — no match → orphaned; hygiene worklist (§9.6). A *visibility*
+4. **Pinned** — no content match, but the entry's latest **landed**
+   path-affecting record is an explicit `RP` (§6.5): visible at the asserted
+   path, flagged `⚠stale` — the agent said *where* it lives; nobody has yet said
+   it still *matches*. Without this layer a below-threshold `mv` would resolve
+   nothing. Self-limiting: it fires only where layers 1–3 fail (on a branch
+   where the move never happened, layers 1/2 still find the old blob at the old
+   path — and the `RP` doesn't even participate there until its line lands,
+   §8.3), and `k`/`u`/`d` retire it. Accepted cost, on the record: until confirmed, a pinned note has
+   folder-note path semantics — delete the destination and let an unrelated file
+   reappear there, and the stale note sits on foreign content (§2.2 rows 13/14,
+   imported for exactly this state).
+5. **Unresolved** — no match → orphaned; hygiene worklist (§9.6). A *visibility*
    fact, never a gate demanding tombstones.
 
 Ambiguity policy (dm detects, agent decides): multiple candidates → prefer the path
@@ -1154,7 +1244,8 @@ notes verbatim; nothing folder-specific.
 
 **Nothing new persisted**: matches land in the disposable cache; `k` re-anchors the
 path key to the resolved location exactly as it re-anchors a file note to the
-current blob — same verb, same `RA` record, no separate re-path record type. Cost
+current blob — same verb, same `RA` record; the separate `RP` type belongs to
+`mv`, which relocates without blessing (§6.5). Cost
 piggybacks on the same batched origin→checkout diff file notes already need (Q2
 unaffected).
 
@@ -1207,6 +1298,12 @@ The fold, per origin O against the current checkout:
    like stale and orphaned, never stored (§2's states stay unstored without
    exception); a **degraded** clone classifies **unknown**, which behaves exactly
    like pending-elsewhere (hidden, not worklisted, §5.3).
+
+Rule (b) is consumed **per record**: every fold-participating record
+(`CR`/`SU`/`RA`/`RP`) carries its own origin, and a checkout folds an entry from
+only the records whose origins classify **landed** here (§8.3). An entry's own
+state is the best across its records — any landed → present here; else any
+pending-elsewhere → pending-elsewhere; else abandoned.
 
 **Verdict records** memoize the one thing git structurally forgets — what became
 of rewritten origin lines. Under the redesign they memoize *only positive
@@ -1320,7 +1417,7 @@ on offer. Not revisited further.
 ### 9.6 Hygiene — worklist, not a gate
 
 `dm worklist` lists everything that wants agent judgment: **orphaned** notes (rule
-(a) layer 4), **abandoned** notes (rule (b)), **ambiguous** follows (splits,
+(a) layer 5), **abandoned** notes (rule (b)), **ambiguous** follows (splits,
 scatters, multi-candidate matches), **disputed** notes (`FB !`), and — on request —
 stale/unconfirmed notes. It is a pure query over store ∪ pending and the current
 checkout; running it changes nothing. Abandoned entries are **grouped by
@@ -1561,9 +1658,32 @@ to snapshot sync results; devs use it to inspect what actually landed.
   are the acceptance spec.
 - **Resolution** — rename bands (§9.2), folder follow heuristic and edge cases
   (§9.3), ambiguity policy, path-hint preference.
-- **Macros** — `mv` expands to per-entry `RA` (rehashed anchors, prefix-rewritten
-  folder keys), `rm` to per-entry `TB`; missing destination file → per-entry error,
-  rest of the batch unaffected; recursive folder cases (§6.5).
+- **Macros** — `mv` expands to per-entry `RP` (path hint + scoping origin; the
+  entry's folded anchor is byte-identical before/after — dump asserts), `rm` to
+  per-entry `TB`;
+  missing destination file → per-entry error, rest of the batch unaffected;
+  recursive folder cases (§6.5). **RP semantics**: a stale note stays `⚠stale`
+  through `mv` and a disputed note stays `⚠disputed` (cleared only by a
+  follow-up `k`/`u`); a below-threshold move `mv`'d then read resolves
+  **pinned** at the new path, `⚠stale` (§9.1 layer 4); the same entry on a
+  branch without the move still resolves at the old path via content (layers
+  1/2 — pinning didn't fire); destination later deleted and replaced by foreign
+  content → the note sits pinned-stale there (accepted, golden); `k:#h` after
+  `mv` re-anchors and clears both flags.
+- **Per-record fold** (§8.3) — **k-no-retract**: note fresh on unmerged branch B,
+  `k` on drifted main: B still reads its pre-`k` state, fresh (the new `RA`
+  folds only where main's HEAD has landed); after B merges main, B folds the
+  `RA`. **u-old-revision-on-branch**: `u` on main; unmerged B reads the
+  superseded body (its lineage's newest) while main reads rev 2; landing main on
+  B switches B to rev 2. **k-on-abandoned-branch-contained**: `k` from branch F,
+  F deleted unmerged: every other line folds the pre-`k` state; the dangling
+  `RA` is inert and swept as garbage. **abandoned-rescue**: entry with no landed
+  record anywhere → worklist; `k` mints an `RA` with a live origin → visible on
+  that line. **concurrent-su-per-line**: `SU`s on two unmerged lines — each line
+  reads its own; the first checkout containing both folds to the larger rec-id
+  (pinned clock). **rp-scoped**: `mv` on branch F; on main (file unchanged at
+  the old path) the entry resolves at the old path — the `RP` hasn't landed —
+  and follows to the new path once F lands.
 - **Hygiene** — flagged entries sink within their proximity group, unflagged
   order untouched; the crowding nudge appears exactly at the threshold and never
   errors; worklist leads with session-scoped items and counts the remainder; the
@@ -1733,7 +1853,7 @@ Q13 §8.2 · Q14 §15. What remains is empirical: three gates (Q1–Q3) that can
 be verified with v1 built, all running on the §11.4 harness.
 
 - **Q1 — does resolution follow ordinary edit churn?** The premise to verify: that
-  everyday editing rarely drops notes to layer 4 (unresolved) of §9.1 — if it
+  everyday editing rarely drops notes to layer 5 (unresolved) of §9.1 — if it
   routinely does, the model fails regardless of the merge story. Rig: replay a real
   repo's history against seeded notes (§11.4) and measure the fraction resolving
   via layers 1–3. The same runs calibrate the acceptance-band fractions (§9.2,
@@ -1788,6 +1908,10 @@ be verified with v1 built, all running on the §11.4 harness.
   hash mentions (reverts embed hashes too).
 - **team-shared vs per-clone stats** — already merged via CRDT counters; revisit if
   per-clone granularity turns out to matter.
+- **shared read lock + per-process stat shards** — unserialize parallel agents in
+  one clone (§8.2): reads take a shared lock and append stat deltas to
+  per-process shard files (union-merged like everything else); v1 serializes on
+  the exclusive lock and waits.
 - **duplicate signal** — none for v1; agent cleans up via CRUD (§6.3).
 - **whole-store search** (`s::term`) — "what do I know about deploys?" has no
   verb in v1; `s` stays context-scoped (§5.5). The single global store makes it
