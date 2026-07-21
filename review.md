@@ -35,7 +35,10 @@ what earns the hard gate") — orphans get the hard gate *without* the scoping.
 the orphan check to paths the branch actually touched.
 
 ### A2. Handle minting degenerates under monotonic ULIDs
-- [ ] open — tracked as design.md §14 **Q9**
+- [x] *(resolved 2026-07-20 as Q9)* Monotonic minting is scoped to rec-ids, where
+  ordering is load-bearing; entry-ids mint with fresh randomness per id, so
+  tail-prefix handles keep their full entropy and stay derived, not stored
+  (design.md §3.5, §8.3).
 
 Handles are the first 6 chars of the 80-bit random tail (§2.5), i.e. its top 30 bits.
 Monotonic mode (§7.3) makes same-millisecond ULIDs *increments* of each other — only the
@@ -134,7 +137,10 @@ too. The real algorithm is a whole-tree fold with a global redirect pass; header
 migration on move is never specified.
 
 ### B5. What is actually stored in the entry-id field?
-- [ ] open — tracked as design.md §14 **Q10**
+- [x] *(resolved 2026-07-20 as Q10)* Records and stat rows hold **full entry-id
+  ULIDs**; handles never appear in stored records — surface-only, resolved at
+  parse time against the visible set. A cross-replica handle collision is an
+  ambiguity error, never record interleaving (design.md §8.3).
 
 §7.3's schema says `<entry-id>` (a ULID, 26 chars); the §7.1 example stores `a3f9c1` —
 the 6-char handle, no ellipsis — in both header rows and body records. If files key on
@@ -149,15 +155,18 @@ corruption. Interacts with A2.
 ## C. Underspecified but load-bearing
 
 ### C1. Link storage and reverse lookup
-- [ ] open — half-dissolved (one-file-per-record answers "which log"); the remaining
-  back-link/handle index is tracked as design.md §14 **Q11**
+- [x] *(resolved 2026-07-20 as Q11)* One-file-per-record answers "which log"; the
+  back-link/handle index is a derived, content-keyed immutable cache file
+  (`index-<store-tip>`), rebuilt wholesale at sync, pending scanned linearly
+  (design.md §8.2).
 
 §7.3 never says *which file's log* an `LN`/`UL` record is appended to. Back-links are
 "computed on read" and `r:#handle` resolves a handle to its home file — both require
 either a whole-shadow-tree scan per read or an index that appears nowhere in the design.
 
 ### C2. No same-batch backreference for freshly minted handles
-- [ ] open — tracked as design.md §14 **Q12**
+- [x] *(resolved 2026-07-20 as Q12)* Positional `$N` backrefs — valid wherever a
+  handle is, parse-rejected unless pointing at an earlier `a` (design.md §4.2).
 
 `a` mints the handle in *output*, so create-then-link — the canonical arch-note gesture,
 per the doc's own agents.md prompt — always costs two round-trips in a design whose
@@ -168,7 +177,10 @@ minting with "an `a` followed by a `u` of the same entry in one batch" — a bat
 **Fix direction:** client-supplied ids, or positional backreferences (`u:$1:...`).
 
 ### C3. No intra-clone concurrency control
-- [ ] open — tracked as design.md §14 **Q13**
+- [x] *(resolved 2026-07-20 as Q13)* One advisory exclusive `flock` on
+  `.git/.dm/lock` for every invocation's duration; dies with the process; minting
+  resumes from the largest pending rec-id so serialized same-millisecond processes
+  stay rec-id-ordered (design.md §8.2).
 
 Two `dm` processes in one clone (parallel agent sessions are the norm now) share a
 replica id and a worktree with zero locking: lost G-counter increments, interleaved
@@ -197,8 +209,9 @@ alone prevents a slop spiral is the biggest unvalidated premise in the document,
 isn't named as a risk anywhere.
 
 ### D2. Dropping whole-store search kills cold recall
-- [ ] open — reopened: the single global store makes it cheap to express; tracked as
-  design.md §14 **Q14**
+- [x] *(resolved 2026-07-20 as Q14)* Deliberately deferred, not dropped: v1 `s`
+  stays context-scoped; the single global store keeps `s::term` cheap to add once
+  the need is demonstrated (design.md §5.5, §15).
 
 "What do I know about deploys?" has no verb: `s` needs a path, and `o`/`d` knowledge
 homed on folders is precisely the knowledge you *don't* discover by reading a code file.
@@ -215,8 +228,10 @@ leads with.
 - [ ] **E2.** C0 rejection in bodies (§3.3) bans tabs, i.e. many pasted code snippets.
 - [ ] **E3.** Paths containing `:` break every non-final field in the grammar
   (`mv:old:new`, `r:path:N` — `r:foo:1` is ambiguous with a file named `foo:1`).
-  Path-valued *record* fields have the sibling problem (spaces); both are folded into
-  design.md §14 **Q6**.
+  Path-valued *record* fields have the sibling problem (spaces); both were folded
+  into **Q6**. *(2026-07-20: the record half is resolved — canonical
+  percent-encoding, design.md §8.3. The grammar half — `:` inside a non-final CLI
+  path field — remains open.)*
 - [x] **E4.** *(resolved 2026-07-14)* `dm unmerged`'s ✓-detection parsed free-text
   merge-commit subjects. Replaced in design.md §8.5 with purely content-based
   detection: second-parent ancestry (true merge), whole-range `git patch-id` (squash),

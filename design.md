@@ -3,9 +3,10 @@
 > **Status:** architecture settled 2026-07-19 — the **content-addressable model**
 > (notes anchored to content + origin, one shared store, visibility computed per read)
 > is adopted, superseding the companion-branch model (rejected; §13). The behavioral
-> requirements (§2) and the mechanics (§3–§12) are normative. What still needs
-> validating or deciding is collected in §14 (Open Questions); intentionally punted
-> scope is §15 (Deferred).
+> requirements (§2) and the mechanics (§3–§12) are normative, with design decisions
+> recorded as dated decision blocks in their sections. What remains is empirical —
+> two build-time validation gates (§14); intentionally punted scope is §15
+> (Deferred).
 
 ---
 
@@ -1500,89 +1501,34 @@ failed validation, was the trailer + recorder-hooks package on companions.
 
 ---
 
-## 14. Open Questions
+## 14. Open Questions — build-time validation gates
 
-Carried from the spike (validation gates — run before/while building v1):
+The questions once tracked here (Q3–Q14) are settled; each decision lives as a
+dated decision block in its home section — Q3 §9.3 · Q4 §9.6 · Q5 §2.1 ·
+Q6 §8.1/§8.3 · Q7 §6.5 · Q8 §8.7 · Q9 §3.5 · Q10 §8.3 · Q11 §8.2 · Q12 §4.2 ·
+Q13 §8.2 · Q14 §15. What remains is empirical: two gates that can only be verified
+with v1 built, both running on the §11.4 harness.
 
-- **Q1 — does resolution follow ordinary edit churn?** If everyday editing routinely
-  drops notes to layer 4 (unresolved) of §9.1, the model fails regardless of the
-  merge story. Metric: fraction of notes resolving via layers 1–3 across a real
-  repo's history replay — which doubles as the calibration rig for the
-  acceptance-band fractions (§9.2, §9.3, §11.4). The pilot additionally tracks the
-  Q4 hygiene metrics: worklist backlog growth, stale fraction, usefulness ratio
-  (§9.6).
-- **Q2 — read-path performance on large repos.** All resolution cost now sits on
-  reads; per-note similarity queries must amortize through the one batched
-  origin→checkout diff that file and folder resolution share, plus the disposable
-  cache (§8.2).
-- **Q3 — split/absorbed UX. Resolved 2026-07-21:** splits surface flagged
-  (`⚠split`, demoted) at *every* candidate — the readers there hold the resolution
-  context; scatter stays worklist-only; vote evidence (majority · margin ·
-  coverage) shows on worklist/drill, flag-only on surfaces; `k:#h[:path]` gains an
-  optional explicit target for per-entry re-homing (same `RA` record), plain `k`
-  still blesses dm's guess (§9.3, §4.2).
-- **Q4 — hygiene without a hard gate. Resolved 2026-07-21:** layered soft
-  pressure, no gate (§9.6) — flag demotion in ranking (§5.6), crowding nudge on `a`
-  acks (§4.3), bounded context-scoped worklist, sync health line (§8.4); hard gates
-  and auto-decay stay rejected on principle. The residual — nothing guarantees the
-  global backlog shrinks (review D1) — is instrumented, not assumed: backlog
-  growth, stale fraction, and usefulness ratio join the Q1 pilot metrics.
-- **Q5 — strict lineage vs. bisect. Resolved 2026-07-21:** strict stands — one
-  visibility rule, no special-casing (§2.1). A bisect mode surfacing later-on-main
-  knowledge about unchanged files at old checkouts is deferred (§15).
-
-From adopting the architecture (surfaced in the 2026-07-19 comparison):
-
-- **Q6 — physical store layout. Resolved 2026-07-20:** store tree =
-  `records/<t4>/<rec-id>` (time-sharded) · `stats/<replica-id>` (one file per
-  replica; field-wise max between copies of one replica's file, sum across
-  replicas) · `blobs/<sha>` (content-addressed; uncommitted bytes stage in
-  pending, never loose in the odb); path-valued fixed fields canonically
-  percent-encoded (`%`, space, C0); stat cadence = pending accumulator folded at
-  sync; verdict record `VD` added to the schema (§8.1, §8.3, §9.4).
-- **Q7 — record form of manual `mv`/`rm`. Resolved 2026-07-21:** both are
-  write-time macros over existing record types — `mv` expands to one `RA` per
-  visible entry homed at the source (file notes: anchor rehashed from the working
-  tree at the mapped destination, per-entry error if absent; folder notes: path-key
-  prefix rewrite), `rm` to one `TB` per visible entry; recursive for folders.
-  Path-scoped redirect records rejected as rules that outlive their evidence
-  (§6.5, §8.3).
-- **Q8 — compaction condition. Resolved 2026-07-21:** `dm gc` (manual, v1) =
-  deterministic mark-and-sweep → orphan re-commit of the slimmed tip tree, `epoch`
-  bumped, pushed under the sync retry loop; any replica may run it. Safety: the
-  **epoch rule** (a replica seeing a newer epoch adopts the fetched tree and
-  re-contributes only its own unpushed records) plus **pending clears only on
-  successful push** make removal stick (§8.4); **dangling ids are ignorable at
-  read** makes uncoordinated sweeps sound (§8.7). Droppability: `TB` lines kept
-  forever (suppressed bodies/blobs reclaimed immediately); shadowed revisions
-  dropped after **3 months** (churn becomes recency-scoped); `VD` droppable iff no
-  surviving record's origin matches; blobs and stat rows by mark-and-sweep (§8.7).
-
-Carried from the review (apply to both architectures — [review.md](review.md)):
-
-- **Q9 (A2) — handle minting under monotonic ULIDs. Resolved 2026-07-20:**
-  monotonic minting is scoped to rec-ids, where ordering is load-bearing; entry-ids
-  mint with fresh randomness per id, so tail-prefix handles keep their full entropy
-  and stay derived, not stored (§3.5, §8.3).
-- **Q10 (B5) — what the stored id field holds. Resolved 2026-07-20:** records
-  (including `LN`/`UL`/`FB`) and stat rows hold **full entry-id ULIDs**; handles
-  never appear in stored records — they are surface-only, resolved at parse time
-  against the visible set (§8.3). A cross-replica handle collision is therefore an
-  ambiguity error, never record interleaving.
-- **Q11 (C1) — back-link / handle-resolution index. Resolved 2026-07-20:** a
-  derived store index in the cache — a content-keyed immutable file
-  (`index-<store-tip>`, atomic rename, versioned header, wholesale load, stdlib
-  binary format, no embedded database); pending is scanned linearly (§8.2).
-- **Q12 (C2) — same-batch backreference. Resolved 2026-07-20:** positional `$N`
-  backrefs — `$N` = the entry created by the batch's Nth command, valid wherever a
-  handle is, parse-rejected unless it points at an earlier `a` (§4.2).
-- **Q13 (C3) — intra-clone concurrency. Resolved 2026-07-20:** one advisory
-  exclusive `flock` on `.git/.dm/lock`, held for every invocation's duration; blocks
-  briefly, then errors; auto-released on process death; minting resumes from the
-  largest pending rec-id so serialized same-ms processes stay rec-id-ordered (§8.2).
-- **Q14 (D2) — whole-store search. Resolved 2026-07-20: deferred** (§15) — v1 `s`
-  stays context-scoped (§5.5); the single global store keeps `s::term` cheap to add
-  once the need is demonstrated.
+- **Q1 — does resolution follow ordinary edit churn?** The premise to verify: that
+  everyday editing rarely drops notes to layer 4 (unresolved) of §9.1 — if it
+  routinely does, the model fails regardless of the merge story. Rig: replay a real
+  repo's history against seeded notes (§11.4) and measure the fraction resolving
+  via layers 1–3. The same runs calibrate the acceptance-band fractions (§9.2,
+  §9.3) and track the Q4 hygiene metrics — worklist backlog growth, stale
+  fraction, usefulness ratio (§9.6).
+- **Q2 — read-path performance on large repos.** The caches (§8.2) and verdict
+  records (§9.4) reduce steady-state reads to an index load plus tree lookups;
+  what needs profiling is the residue: the **cold path** (first read after a
+  checkout switch or sync — index rebuild plus the batched diffs), **diff
+  multiplicity** (one batched origin→checkout diff per *distinct origin* among
+  unresolved notes, and origins accumulate over a store's life), **checkout-side
+  lookup** (anchored blob → current tree plus working-tree dirt, recomputed per
+  invocation — the working tree has no stable key to memoize under), and
+  **pending-elsewhere re-checks** (a live state, never memoized: all-refs
+  reachability reruns until the origin lands or is abandoned). Profiling matrix:
+  repo size × cold/warm cache × checkout age × unresolved-note count. If the index
+  itself bottlenecks, the upgrade paths are pre-paid (§8.2: mmap'd arrays,
+  incremental chaining).
 
 ---
 
