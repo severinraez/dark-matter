@@ -296,7 +296,7 @@ Execution is **two-phase**:
 | `u` | `u:#handle:body`        | supersede an entry's body                |
 | `d` | `d:#handle`             | tombstone an entry                       |
 | `f` | `f:#handle:sig[:reason]`| feedback (`sig` ∈ `+` `-` `!`)           |
-| `k` | `k:#handle`             | confirm note still valid; re-anchor      |
+| `k` | `k:#handle[:path]`      | confirm valid; re-anchor (split: §9.3)   |
 | `mv`| `mv:old:new`            | relocate notes manually (§6.5); folders: recursive |
 | `rm`| `rm:path`               | tombstone all entries at path (recursive)|
 | `al`| `al:#a:#b[:note]`       | add link between two entries, opt comment|
@@ -458,7 +458,7 @@ fully deterministic, no tuning.
 > weights is deferred (§15) rather than guessed now.
 >
 > **Amendment — flag demotion (2026-07-21, part of Q4).** Flagged entries (⚠stale ·
-> ⚠disputed · ⚠unconfirmed) sink below unflagged ones **within their proximity
+> ⚠disputed · ⚠unconfirmed · ⚠split) sink below unflagged ones **within their proximity
 > group**; subject priority still orders inside each band. A flag is binary, so this
 > is a third deterministic sort key, not a scoring function — the weighted-score
 > deferral above stands, and usage-signal demotion stays with it (§15). Readers see
@@ -478,9 +478,10 @@ records:
 - `u:#handle:body` → append a **supersede** (`SU`) record — same handle, new
   revision, re-stamps the anchors,
 - `d:#handle` → append a **tombstone** (`TB`) record — handle resolves to deleted,
-- `k:#handle` → append a **re-anchor** (`RA`) record — re-stamps the anchors (current
-  blob / resolved path + current HEAD), **no new body revision** (§9.5), so churn
-  stats stay clean.
+- `k:#handle[:path]` → append a **re-anchor** (`RA`) record — re-stamps the anchors
+  (current blob / resolved path + current HEAD), **no new body revision** (§9.5), so
+  churn stats stay clean. The optional path names the new home explicitly when dm
+  could not pick one — the split case (§9.3).
 
 ### 6.2 Handle stability
 The handle addresses the **logical entry**, not a revision or a position, so it is
@@ -1126,6 +1127,31 @@ described → follow with an unconfirmed flag regardless of vote strength; **emp
 folders** — git cannot represent them, so a folder containing no files has nothing
 to diff (inherent limit).
 
+> **Decision — split/absorbed UX (2026-07-21, resolves Q3).** Three parts:
+>
+> 1. **Splits surface at every candidate, flagged.** While ambiguous, the note
+>    appears as a parent note for reads under *each* candidate prefix, marked
+>    `⚠split` and demoted like every flag (§5.6). It is wrong at one candidate by
+>    construction, but the flag states exactly that uncertainty — and the readers
+>    under the candidates are the only agents with the context to resolve it, at
+>    the moment they have it. Worklist-only surfacing was rejected: under the Q4
+>    soft-pressure model an invisible split could stay unresolved indefinitely.
+>    **Scatter** — no candidate at all — is worklist-only by necessity.
+> 2. **Evidence rides the worklist and the drill, not the surface.** Surfaces show
+>    only the flag; `dm worklist` and `r:#handle` show the vote so judgment is
+>    cheap: `#f22e90 a api/ ⚠split → api-core/ 6/10 · api-http/ 4/10 · cov 100%`;
+>    absorbed: `→ lib/ ⚠unconfirmed (vote unanimous · target 87% foreign)`. The
+>    numbers are the three follow-heuristic checks (majority · margin · coverage) —
+>    already computed at resolution, shown instead of re-derived.
+> 3. **`k` gains an optional explicit target** — `k:#h:api-core/` re-homes *this
+>    entry* to the named candidate: the same `RA` record as plain `k`, which keeps
+>    meaning "bless dm's guess" (the absorbed/unconfirmed case). The path is the
+>    final field, so `:` in it needs no escaping (Q6 rule). `mv` stays purely
+>    path-level (Q7); it cannot express per-entry choices, which mixed splits need.
+>    A note that genuinely applies to both halves: `k` it to one home and write a
+>    fresh `a` at the other (optionally `al`-linked) — no duplication machinery in
+>    v1.
+
 ### 9.4 Rule (b) — has the origin landed?
 
 Origin ancestor of HEAD → landed here · else a **landed verdict** exists → landed ·
@@ -1292,8 +1318,8 @@ concise.
 >
 > **Write on learning.** `a:path:subj:body` (subj: `c` code/behavior · `a`
 > architecture · `d` dev/build/test · `o` ops). `u:#handle:body` supersedes ·
-> `d:#handle` removes · `k:#handle` re-blesses a stale note · `f:#handle:!:reason`
-> flags one wrong.
+> `d:#handle` removes · `k:#handle[:path]` re-blesses a stale note (the path picks a
+> split's home) · `f:#handle:!:reason` flags one wrong.
 >
 > **Link related notes.** Links are the only way notes relate — `al:#a:#b[:why]`
 > connects two entries (directed `a→b`, optional comment); `dl:#a:#b` removes one.
@@ -1305,7 +1331,8 @@ concise.
 > **Output.** Blocks split on `▸` (command echo, then raw content); `◾` ends the
 > stream. Glyphs: `→` link · `↑` parent note · `←` linked-from · `⚠stale` (file
 > changed since the note) · `⚠unconfirmed` (followed a move by inference) ·
-> `⚠disputed` (flagged wrong). `(+N lines)` = hidden size. Handles `#a3f9c1` are
+> `⚠disputed` (flagged wrong) · `⚠split` (folder went two-plus places — pick the
+> home with `k:#handle:path`). `(+N lines)` = hidden size. Handles `#a3f9c1` are
 > stable — copy them into later commands.
 >
 > **Batch over stdin**, one command per line, body always last (`:` in a body needs
@@ -1399,6 +1426,10 @@ to snapshot sync results; devs use it to inspect what actually landed.
   order untouched; the crowding nudge appears exactly at the threshold and never
   errors; worklist leads with session-scoped items and counts the remainder; the
   sync health line matches worklist counts (§9.6).
+- **Split/absorbed UX** (Q3) — a split note surfaces `⚠split` at each candidate and
+  demoted; worklist/drill lines carry vote · margin · coverage; `k:#h:path` re-homes
+  one entry while sibling entries stay ambiguous; plain `k` blesses an unconfirmed
+  follow; scatter appears only on the worklist (§9.3).
 - **Verdicts** — squash and rebase landings, abandoned branches, the
   landed-beats-abandoned fold, wrong-verdict repair (§9.4).
 - **Sync** — two replicas, union convergence, non-ff retry, stat counter merge
@@ -1484,8 +1515,12 @@ Carried from the spike (validation gates — run before/while building v1):
   reads; per-note similarity queries must amortize through the one batched
   origin→checkout diff that file and folder resolution share, plus the disposable
   cache (§8.2).
-- **Q3 — split/absorbed UX.** The agent-facing flow for the folder cases dm refuses
-  to auto-follow (split) or follows unconfirmed (absorbed) (§9.3).
+- **Q3 — split/absorbed UX. Resolved 2026-07-21:** splits surface flagged
+  (`⚠split`, demoted) at *every* candidate — the readers there hold the resolution
+  context; scatter stays worklist-only; vote evidence (majority · margin ·
+  coverage) shows on worklist/drill, flag-only on surfaces; `k:#h[:path]` gains an
+  optional explicit target for per-entry re-homing (same `RA` record), plain `k`
+  still blesses dm's guess (§9.3, §4.2).
 - **Q4 — hygiene without a hard gate. Resolved 2026-07-21:** layered soft
   pressure, no gate (§9.6) — flag demotion in ranking (§5.6), crowding nudge on `a`
   acks (§4.3), bounded context-scoped worklist, sync health line (§8.4); hard gates
