@@ -108,8 +108,11 @@ content no longer exists anywhere dm can place it). Stale and orphaned are disti
 design: drift dm can locate is flagged and stays usable; only notes dm cannot place
 leave normal reads for the worklist. Nothing is ever silently destroyed.
 
-Row 15's strict-lineage reading (notes written *later on main itself* stay hidden from
-old-main checkouts during bisect) stands until decided — open question **Q5** (§14).
+> **Decision — strict lineage stands (2026-07-21, resolves Q5).** Row 15 is read
+> strictly: notes written *later on main itself* stay hidden from old-main checkouts.
+> One rule, no special-casing — a note is visible iff its content is present and its
+> origin line had landed *as of the checkout*. A bisect mode that surfaces later
+> knowledge about unchanged files at old checkouts is **deferred** (§15).
 
 ### 2.2 Folder notes
 
@@ -348,7 +351,11 @@ Parse = split on `▸`; the first line of each block is the verbatim command ech
 rest is raw content; `◾` closes the stream.
 
 Write acks are one line: `+ #handle created`, `✓ #handle superseded (rev N)`,
-`✓ #handle tombstoned`, `✓ #handle feedback +`, or `✗ #handle <error>`.
+`✓ #handle tombstoned`, `✓ #handle feedback +`, or `✗ #handle <error>`. An `a`
+landing on a node already carrying many visible notes appends the crowding nudge
+(2026-07-21, Q4, §9.6) to its ack — `+ #b41f02 created · node has 9 notes, consider
+folding with u` — still one line, never an error; the threshold is an implementation
+constant tuned in the pilot.
 
 > **Decision:** use the Unicode structure glyphs (`→` link, `↑` parent, `←`
 > linked-from, `★` arch, `⚠` stale) — visually unambiguous and collision-proof against
@@ -440,15 +447,23 @@ OR-group has all its `+`-joined terms present.
 
 ### 5.6 Ranking
 When more fits than the budget allows, order by **proximity** (closer ancestors first)
-→ **subject priority** (arch first for orientation). That is the whole v1 ranking —
-two keys, fully deterministic, no tuning.
+→ **flag state** (unflagged before ⚠-flagged; added 2026-07-21, Q4) → **subject
+priority** (arch first for orientation). That is the whole v1 ranking — three keys,
+fully deterministic, no tuning.
 
-> **Decision:** v1 ranks on **proximity then subject priority only**. Staleness,
-> recency, and the usage-stat signals (expansion rate, usefulness ratio) are
-> *collected* (§7) but kept **out of the ranking** until there's data to weight them
-> against — a scoring function with weights is deferred (§15) rather than guessed
-> now. Stale entries are still *flagged* on read (§9.5); they just don't reorder for
-> it in v1.
+> **Decision:** v1 ranks on **proximity then subject priority only** — amended
+> 2026-07-21 by the binary flag demotion below. Recency and the usage-stat signals
+> (expansion rate, usefulness ratio) are *collected* (§7) but kept **out of the
+> ranking** until there's data to weight them against — a scoring function with
+> weights is deferred (§15) rather than guessed now.
+>
+> **Amendment — flag demotion (2026-07-21, part of Q4).** Flagged entries (⚠stale ·
+> ⚠disputed · ⚠unconfirmed) sink below unflagged ones **within their proximity
+> group**; subject priority still orders inside each band. A flag is binary, so this
+> is a third deterministic sort key, not a scoring function — the weighted-score
+> deferral above stands, and usage-signal demotion stays with it (§15). Readers see
+> healthy notes first regardless of store debt; part of the Q4 soft-pressure
+> package (§9.6).
 
 ---
 
@@ -493,9 +508,23 @@ the **manual override** for the residue resolution can't infer — move + heavy 
 below the similarity threshold, splits, ambiguous folder scatters — and the way to
 act on worklisted orphans. Folders are recursive. `rm:path` tombstones every entry
 homed at a path (recursive for folders): the node-level counterpart to `d:#handle`,
-for paths whose knowledge is genuinely gone. Both remain ordinary batch commands. The
-record form `mv` appends (per-entry re-anchor vs. a path-scoped record) is open —
-**Q7** (§14).
+for paths whose knowledge is genuinely gone. Both remain ordinary batch commands.
+
+> **Decision — `mv`/`rm` are write-time macros (2026-07-21, resolves Q7).** Neither
+> verb has a record type of its own; both expand at write time into records that
+> already exist. `mv:old:new` appends one `RA` per **visible** entry homed at `old`
+> (recursive for folders): file notes get a fresh anchor — `git hash-object` of the
+> working-tree file at the mapped destination, origin = HEAD now — so the entry is
+> re-stamped to current reality; folder notes get their path-key anchor rewritten by
+> prefix substitution. If the destination file is absent from the working tree, that
+> expansion fails as a **per-entry error** in batch output (`mv` describes a move
+> that happened; it does not invent one). `rm:path` expands to one `TB` per visible
+> entry, recursive likewise. Entries not yet visible (e.g. pending on an unmerged
+> branch) are untouched — when they land they surface as residue and get their own
+> fix; that is the uniform drift path, not a gap. Path-scoped redirect records were
+> rejected: redirects are rules that outlive their evidence (chaining, cycles,
+> precedence against automatic resolution, landmines for future entries at reused
+> paths) — the same redirect-map machinery §13 already discarded.
 
 ---
 
@@ -614,13 +643,15 @@ memoized query result (verdicts, §9.4) or a disposable cache.
   `refs/heads/dm-store` branch is the fallback if a forge misbehaves (forks copy only
   heads and tags).
 
-> **Decision — store tree layout (2026-07-20, resolves Q6).** Three top-level dirs:
+> **Decision — store tree layout (2026-07-20, resolves Q6).** Three top-level dirs
+> plus one marker file:
 >
 > ```
 > records/<t4>/<rec-id>    # one file per record, sharded by the rec-id's first
 >                          # 4 chars (≈12-day ULID-time windows)
 > stats/<replica-id>       # one file per replica: "<entry-id> i:<n> x:<n> h:<n> t:<ms>" rows
 > blobs/<2ch>/<38ch>       # anchored blobs, content-addressed like git's odb
+> epoch                    # compaction generation counter (§8.7; added 2026-07-21, Q8)
 > ```
 >
 > - **Records** shard by time prefix so tree objects stay small and old shards
@@ -720,8 +751,8 @@ type-specific, body last:
 > therefore an input-ambiguity error (§3.5), never record interleaving.
 
 There is **no `MV` record type**: the companion model's redirect-map machinery is
-gone — moves are *derived* at read time (§9.1–§9.3), and the manual `mv` verb's
-record form is open (**Q7**, §14).
+gone — moves are *derived* at read time (§9.1–§9.3), and the manual `mv`/`rm` verbs
+are write-time macros over `RA`/`TB` (decision in §6.5, resolves Q7).
 
 > **Decision — serialization.** Fields are separated by a **single space** (never
 > cosmetic alignment padding). Every record's fixed fields come first; the parser
@@ -809,6 +840,25 @@ Properties:
 - **Convergence is eventual, not immediate** — two clones can transiently disagree on
   rule (b) when one has fetched an origin commit the other lacks, until the first
   memoized verdict record lands in the store (§9.4).
+- **Ends with a health line** (added 2026-07-21, Q4) — one summary line of worklist
+  counts, session-scoped then global (`3 stale · 1 orphaned near your work · 41
+  elsewhere`): the backlog is surfaced at every share point, never demanded (§9.6).
+
+> **Decision — epoch rule and push-clears-pending (2026-07-21, part of Q8).** Naive
+> set-union cannot unlearn: a compacted-away record would be re-added by the first
+> sync from any replica still holding the old tree. Two amendments make removal
+> stick:
+>
+> 1. **Epoch rule.** The tip tree carries an `epoch` generation counter (§8.1),
+>    bumped only by compaction (§8.7). If a fetched tip's epoch is **newer** than the
+>    local store's, the replica adopts the fetched tree wholesale and re-contributes
+>    only its **own not-yet-pushed records** — it never re-uploads records it merely
+>    received, since anything the newer-epoch tip lacks was removed deliberately.
+>    Same epoch → plain union as above.
+> 2. **Pending clears only on successful push.** Folding pending into a candidate
+>    store commit does not consume it; only a push that lands does. So when a retry
+>    loses a race (to another sync or to a compaction), the replay always knows
+>    exactly what "own unpushed records" means.
 
 **Persistence table.** Rows mirror the requirements table in §2.1; "derived" = no
 write, computed at read time from code-repo state + store ∪ pending.
@@ -843,9 +893,9 @@ except pending, which is by definition not yet shared.
   large-repo performance gets sharper — **Q2** (§14).
 - **Convergence is eventual** — the row-14 asterisk above.
 - **Store growth**: anchored blobs ride in the store tree; overhead is only truly
-  uncommitted content (§8.1). Compaction condition: **Q8** (§14).
+  uncommitted content (§8.1). Reclaimed by `dm gc` (§8.7).
 - **No forcing function for hygiene**: the worklist replaces the companion model's
-  hard gate; what supplies the pressure to act on it is **Q4** (§14).
+  hard gate; pressure is supplied by the Q4 soft layers (§9.6), never by a gate.
 
 ### 8.5 Replica identity
 G-Counters need a stable per-clone **replica id**, kept in `.git/.dm/replica` (one
@@ -907,6 +957,59 @@ A follow-up `r:#a3f9c1` binary-searches the tail-sorted entry array for prefix
 `A3F9C1`, returns the full body + links one level, and counts the click (`x+1`,
 `t=now`). The five states are never stored — rules (a)/(b) recompute them on every
 read.
+
+### 8.7 Compaction — `dm gc`
+
+> **Decision (2026-07-21, resolves Q8).** The store's *history* carries no
+> information — records are self-timestamped, only the tip tree is data — so
+> compaction is an **orphan re-commit** of a slimmed tip tree with `epoch` bumped
+> by one, pushed under the same non-ff fetch-retry loop as sync. Any replica may
+> run it; there is no coordinator. The trigger is **manual `dm gc` only** (v1); the
+> sweep is a deterministic mark-and-sweep with a canonical tree build, so two
+> concurrent compactors over the same tip produce the same tree SHA and the race
+> is benign. A normal sync landing mid-compaction is absorbed by the retry loop:
+> refetch, re-sweep, re-push.
+>
+> **What a sweep keeps / drops:**
+>
+> - **Tombstones**: the `TB` line itself is kept **forever** — one short line, the
+>   permanent suppressor that keeps a late resurrection dead. Everything it
+>   suppresses (the entry's `CR`/`SU` bodies, `LN`/`UL`/`FB`, stat rows, anchored
+>   blobs) is reclaimed immediately at the next sweep.
+> - **Shadowed revisions** (`CR`/`SU` hidden behind a later `SU`): dropped when
+>   older than **3 months** (rec-id ULID age). Within the window they stay, so the
+>   derived churn count (§7.1) becomes **recency-scoped** — deliberate: recent
+>   churn is the volatility signal; ancient churn on a since-stable note is noise.
+> - **Verdicts**: a `VD` is droppable **iff no surviving record's origin field
+>   matches it**. Landed verdicts are irreplaceable evidence once the origin commit
+>   is GC'd (patch-ids can no longer be computed), so they live as long as any
+>   record needs them. Abandoned verdicts are re-derivable in principle (absence of
+>   evidence re-derives), but the same referential rule keeps them as cheap
+>   memoization; their lifetime is bounded by their referencing records — see the
+>   lifecycle note below.
+> - **Blobs**: mark-and-sweep from surviving records' anchor fields; unreferenced
+>   `blobs/<sha>` files drop.
+> - **Stat rows** keyed to purged entries drop from each `stats/<replica-id>` file;
+>   a racing sync may transiently resurrect rows (field-wise max is monotone —
+>   harmless), and the next sweep removes them again.
+>
+> **Safety invariant — dangling ids are ignorable.** The compactor can never see
+> other replicas' pending, so a late-landing record may reference a purged entry
+> (`SU` on it, `LN` into it, stat rows). Defined semantics: dangling references are
+> **ignored at read**, and headless records are themselves garbage for the next
+> sweep. Every droppability rule above must keep the store a valid CRDT state under
+> late union of any replica's pending — this invariant is what makes uncoordinated
+> compaction sound. Reintroduction by stale full copies is prevented separately by
+> the epoch rule (§8.4).
+>
+> **Abandoned-verdict lifecycle.** An abandoned `VD` is minted at first read that
+> finds an origin unreachable and unlanded (§8.4 row 13); it pins nothing open
+> indefinitely. It lives exactly as long as records carrying that origin: the
+> worklisted entry is eventually tombstoned (`d` → records purge at next sweep),
+> re-anchored (`k`/`u` → the old origin survives only in shadowed revisions, which
+> age out in 3 months), or deliberately kept — in which case keeping its one-line
+> memo is correct, since it is what spares every read the unreachability scan.
+> `TB` lines kept forever pin no verdicts: `TB` has no origin field.
 
 ---
 
@@ -1088,10 +1191,38 @@ checkout; running it changes nothing.
 Unlike the companion model's pre-commit gate, the worklist is **never a forcing
 function and never destructive**: an unresolved note stops *surfacing* in normal
 reads; nothing demands tombstones, so skew or an odd checkout can never pressure the
-agent into destroying live knowledge. The flip side is accepted and named: v1 ships
-no mechanism that *forces* hygiene — what supplies the pressure (ranking, decay,
-review cadence) is open question **Q4** (§14), and it matters more in this
-architecture, not less.
+agent into destroying live knowledge. What supplies the pressure instead is the
+layered soft-pressure package below.
+
+> **Decision — layered soft pressure, no gate (2026-07-21, resolves Q4).** Nothing
+> ever *forces* hygiene: a hard gate is a destructive-compliance machine and stays
+> rejected, as does auto-decay/TTL (destructive expiry violates
+> never-silently-destroyed; non-destructive expiry silently hides cold-but-valid
+> knowledge — the Q14 recall case). Pressure instead rides moments where the agent
+> already has the context to act, in four layers:
+>
+> 1. **Flag demotion in ranking** (§5.6) — ⚠-flagged entries sink below unflagged
+>    ones within their proximity group. Readers stay protected from debt before
+>    anyone cleans it.
+> 2. **Crowding nudge** (§4.3) — an `a` ack on a node already carrying many visible
+>    notes appends a one-line hint to fold with `u`/`d`. Slop is caught at write
+>    time, when the writer has just read the node's surface and knows what overlaps.
+> 3. **Scoped worklist** — the default listing is bounded and context-scoped: it
+>    leads with items homed on or near paths this replica's session has read or
+>    written (derived from the pending records and the pending stat accumulator — no
+>    new state) and gives the global remainder as a count; a flag lists everything.
+>    Each item lands in front of the session best equipped to judge it, while the
+>    context is fresh.
+> 4. **Sync health line** (§8.4) — every sync ends with one line of worklist counts,
+>    session-scoped then global. The backlog is never invisible.
+>
+> Every layer converts a global, someday chore into a local, now, in-context one —
+> but none guarantees the global backlog shrinks. That residual is review finding D1
+> (agent discipline alone preventing a slop spiral is the design's biggest
+> unvalidated premise), so it is instrumented rather than assumed: the Q1 pilot
+> additionally tracks **worklist backlog growth, stale fraction, and usefulness
+> ratio**; if the backlog grows without bound under these layers, Q4 reopens with
+> data (§14).
 
 Worklist entries are resolved with the ordinary verbs: `k` (re-anchor/re-bless), `u`
 (rewrite), `d` (tombstone), `mv` (manual re-home), `rm` (retire a dead path).
@@ -1112,6 +1243,7 @@ to:
 | `dm init` | create `.git/.dm/` (replica id, pending, cache), configure the `refs/dm/*` refspec, fetch or create the empty store (once per clone) |
 | `dm sync` | share: fold pending → fetch → union merge → push with retry (§8.4) |
 | `dm worklist` | the hygiene query (§9.6) |
+| `dm gc` | compact the store: sweep garbage, orphan re-commit, epoch bump (§8.7) |
 | `dm dump [path]` | full raw store state, for tests and debugging (§11.3) |
 
 There is no checkout, no merge, no push/fetch pair, no prune, no gate: visibility
@@ -1189,8 +1321,9 @@ concise.
 > **Session lifecycle** — there is nothing to mirror: notes follow your branch
 > through rebases, squashes, and merges automatically, and your own notes are usable
 > the moment you write them. Run **`dm sync`** at session end (and whenever you want
-> teammates' notes) to share both notes and read-stats. Skim **`dm worklist`**
-> occasionally and resolve what you have context for: `k` (still valid), `u`
+> teammates' notes) to share both notes and read-stats; its footer reports how much
+> wants judgment. Skim **`dm worklist`** at wrap-up — it leads with items near your
+> session's work — and resolve what you have context for: `k` (still valid), `u`
 > (rewrite), `d` (obsolete), `mv`/`rm` (re-home / retire a path).
 
 ---
@@ -1259,10 +1392,23 @@ to snapshot sync results; devs use it to inspect what actually landed.
   are the acceptance spec.
 - **Resolution** — rename bands (§9.2), folder follow heuristic and edge cases
   (§9.3), ambiguity policy, path-hint preference.
+- **Macros** — `mv` expands to per-entry `RA` (rehashed anchors, prefix-rewritten
+  folder keys), `rm` to per-entry `TB`; missing destination file → per-entry error,
+  rest of the batch unaffected; recursive folder cases (Q7, §6.5).
+- **Hygiene** (Q4) — flagged entries sink within their proximity group, unflagged
+  order untouched; the crowding nudge appears exactly at the threshold and never
+  errors; worklist leads with session-scoped items and counts the remainder; the
+  sync health line matches worklist counts (§9.6).
 - **Verdicts** — squash and rebase landings, abandoned branches, the
   landed-beats-abandoned fold, wrong-verdict repair (§9.4).
 - **Sync** — two replicas, union convergence, non-ff retry, stat counter merge
   (G-Counters sum across replicas; LWW `t` picks the max).
+- **Compaction** — `dm gc` drops what the §8.7 rules say and nothing else; epoch
+  rule: a stale replica syncing across a compaction re-contributes only its own
+  unpushed records (no resurrection); late pending referencing a purged entry lands
+  dangling, is ignored at read, and is swept next pass; TB stays dead forever;
+  landed `VD` survives while any record carries its origin; concurrent gc + sync
+  race converges; pending survives a lost push race.
 - **Locking** — concurrent invocations serialize on `.git/.dm/lock`; rec-id order
   survives a same-millisecond process handoff (Q13, §8.2).
 - **Determinism** — same records, different sync orders/replicas → identical folded
@@ -1331,20 +1477,24 @@ Carried from the spike (validation gates — run before/while building v1):
   drops notes to layer 4 (unresolved) of §9.1, the model fails regardless of the
   merge story. Metric: fraction of notes resolving via layers 1–3 across a real
   repo's history replay — which doubles as the calibration rig for the
-  acceptance-band fractions (§9.2, §9.3, §11.4).
+  acceptance-band fractions (§9.2, §9.3, §11.4). The pilot additionally tracks the
+  Q4 hygiene metrics: worklist backlog growth, stale fraction, usefulness ratio
+  (§9.6).
 - **Q2 — read-path performance on large repos.** All resolution cost now sits on
   reads; per-note similarity queries must amortize through the one batched
   origin→checkout diff that file and folder resolution share, plus the disposable
   cache (§8.2).
 - **Q3 — split/absorbed UX.** The agent-facing flow for the folder cases dm refuses
   to auto-follow (split) or follows unconfirmed (absorbed) (§9.3).
-- **Q4 — hygiene without a hard gate.** The gate became an optional worklist and
-  stale/orphaned are mere classifications — what supplies the forcing function
-  (ranking, decay, review cadence)? Review finding D1 grows *more* important under
-  this model (§9.6).
-- **Q5 — strict lineage vs. bisect** (§2.1 row 15). Strict reading hides notes
-  written later on main itself from old-main checkouts — during bisect one might
-  *want* later knowledge about unchanged files. Strict stands until decided.
+- **Q4 — hygiene without a hard gate. Resolved 2026-07-21:** layered soft
+  pressure, no gate (§9.6) — flag demotion in ranking (§5.6), crowding nudge on `a`
+  acks (§4.3), bounded context-scoped worklist, sync health line (§8.4); hard gates
+  and auto-decay stay rejected on principle. The residual — nothing guarantees the
+  global backlog shrinks (review D1) — is instrumented, not assumed: backlog
+  growth, stale fraction, and usefulness ratio join the Q1 pilot metrics.
+- **Q5 — strict lineage vs. bisect. Resolved 2026-07-21:** strict stands — one
+  visibility rule, no special-casing (§2.1). A bisect mode surfacing later-on-main
+  knowledge about unchanged files at old checkouts is deferred (§15).
 
 From adopting the architecture (surfaced in the 2026-07-19 comparison):
 
@@ -1355,18 +1505,23 @@ From adopting the architecture (surfaced in the 2026-07-19 comparison):
   pending, never loose in the odb); path-valued fixed fields canonically
   percent-encoded (`%`, space, C0); stat cadence = pending accumulator folded at
   sync; verdict record `VD` added to the schema (§8.1, §8.3, §9.4).
-- **Q7 — record form of manual `mv`/`rm`.** The companion model's `MV`
-  redirect-map/fixpoint machinery is gone; `mv` survives as the manual-residue verb
-  (§6.5). What it appends — per-entry re-anchor (`RA` with new path) vs. a
-  path-scoped record — and how recursive folder `mv` is represented, is unsettled.
-- **Q8 — compaction condition.** The old trigger ("sunk below the merge-base of all
-  live companion branches") no longer exists. When may superseded revisions,
-  tombstoned entries, stale verdicts, and no-longer-referenced anchored blobs be
-  dropped from the single store, without losing concurrent increments or breaking
-  row-14 convergence (§8.4)? Note (2026-07-20): the store's *history* carries no
-  information — records are self-timestamped, only the tip tree is data — so
-  compaction can plausibly be an orphan re-commit of the tip tree; the open part is
-  the coordination/safety condition.
+- **Q7 — record form of manual `mv`/`rm`. Resolved 2026-07-21:** both are
+  write-time macros over existing record types — `mv` expands to one `RA` per
+  visible entry homed at the source (file notes: anchor rehashed from the working
+  tree at the mapped destination, per-entry error if absent; folder notes: path-key
+  prefix rewrite), `rm` to one `TB` per visible entry; recursive for folders.
+  Path-scoped redirect records rejected as rules that outlive their evidence
+  (§6.5, §8.3).
+- **Q8 — compaction condition. Resolved 2026-07-21:** `dm gc` (manual, v1) =
+  deterministic mark-and-sweep → orphan re-commit of the slimmed tip tree, `epoch`
+  bumped, pushed under the sync retry loop; any replica may run it. Safety: the
+  **epoch rule** (a replica seeing a newer epoch adopts the fetched tree and
+  re-contributes only its own unpushed records) plus **pending clears only on
+  successful push** make removal stick (§8.4); **dangling ids are ignorable at
+  read** makes uncoordinated sweeps sound (§8.7). Droppability: `TB` lines kept
+  forever (suppressed bodies/blobs reclaimed immediately); shadowed revisions
+  dropped after **3 months** (churn becomes recency-scoped); `VD` droppable iff no
+  surviving record's origin matches; blobs and stat rows by mark-and-sweep (§8.7).
 
 Carried from the review (apply to both architectures — [review.md](review.md)):
 
@@ -1404,9 +1559,11 @@ Carried from the review (apply to both architectures — [review.md](review.md))
   (§5.6); folding staleness, recency, and usage signals (expansion rate, usefulness
   ratio, feedback) into a weighted score waits until there's real usage data to tune
   the weights against.
-- **compaction** — fold superseded revisions, drop tombstoned rows and settled
-  verdicts, prune unreferenced anchored blobs, coalesce counters; must be
-  coordinated to not lose concurrent increments. Its safety condition is **Q8**.
+- **bisect mode** (Q5) — an opt-in read mode (flag or config) relaxing rule (b) at
+  detached old checkouts so later-on-main knowledge about *unchanged* files (rule
+  (a) still holds) surfaces during bisect; v1 stays strict (§2.1).
+- **auto-triggered compaction** — v1 compaction is manual `dm gc` only (§8.7);
+  running it automatically at sync past a size/garbage threshold is a later knob.
 - **Lamport counters in record headers** — retire the wall-clock caveat on
   ULID-ordered LWW folds (§8.3) without changing transport.
 - **LWW-overridable verdict records** — batch repair for the many-notes-per-origin

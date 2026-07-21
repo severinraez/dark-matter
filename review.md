@@ -183,8 +183,12 @@ processes using the same one simultaneously.
 ## D. Strategic / product-level
 
 ### D1. v1 ships unlimited write throughput and defers the entire hygiene loop
-- [ ] open — promoted: grows *more* important without the hard gate; tracked as
-  design.md §14 **Q4**
+- [x] *(resolved 2026-07-21)* Named and instrumented rather than gated: design.md
+  §9.6 adopts four soft-pressure layers (flag demotion in ranking, crowding nudge
+  on write acks, bounded context-scoped worklist, sync health line); hard gates and
+  auto-decay rejected on principle. The premise this finding names is now tracked
+  by pilot metrics (worklist backlog growth, stale fraction, usefulness ratio)
+  attached to Q1.
 
 Ranking weights, housekeeping report, compaction, dedup — every mechanism that would
 keep the store healthy is in §11, while the write path is fully armed (including
