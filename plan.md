@@ -140,3 +140,54 @@ docs, release.
 
 **Gate summary:** Q1 fires at M5, Q3 at M6, Q2 at M9 (it needs a full
 system to profile). All three run on the §11.4 harness.
+
+---
+
+## Dependencies
+
+§12 (single binary, nothing at runtime beyond git ≥ 2.15) plus the
+stdlib-only cache decision (§8.2) forecloses most library choices. Net
+footprint: **three modules ever**, one of them test-only; everything else
+is stdlib + exec'd git.
+
+**Confirmed closed by design.md (not revisitable):**
+
+| concern | decision | why closed |
+|---|---|---|
+| git access | exec the git CLI (`os/exec`) — never go-git / git2go | §12 pins plumbing incl. `patch-id` and `-M`/`-C` rename detection; go-git lacks patch-id and scores renames differently, while the §9.2 bands are calibrated against C git's algorithm |
+| cache/index format | stdlib `encoding/binary`, length-prefixed | explicit decision block, §8.2 |
+| output/records | plain text + canonical encoding, no serialization lib | §8.3 byte-identity invariant |
+
+**Chosen libraries:**
+
+1. `github.com/oklog/ulid/v2` — monotonic entropy mode (rec-ids), fresh
+   entropy (entry-ids), injectable timestamp + entropy source (§11.2
+   determinism overrides); its Crockford base32 codec is reused for handles
+   and the replica id. Hand-rolling rejected: monotonic-rollover edge cases
+   are exactly where it bites.
+2. `github.com/gofrs/flock` — `flock(2)`/`LockFileEx` with blocking wait
+   (§8.2), both platforms, tiny. The holder-pid notice is ours regardless
+   (pid written into the lockfile alongside).
+3. `github.com/google/go-cmp` — **test-only**; best-in-class structure and
+   golden-output diffs. testify rejected: stdlib `testing` style + go-cmp
+   covers it.
+
+**E2E harness style:** Go-native harness (small `e2e` package:
+`CopyFixture`, `RunDM(stdin)`, `Golden(t, …)`) over
+`rogpeppe/go-internal/testscript` — the §11.4 scenarios are dominated by
+git choreography (rebase/squash/force-push, two-replica sync,
+copy-per-test) that wants real helper functions, not a txtar DSL. Revisit
+testscript only if scenario boilerplate hurts in M2.
+
+**Deliberate hand-rolls** (so nobody "helpfully" imports something):
+
+- **Percent-encoding canon** — *not* `net/url` (it encodes a different
+  set). The canonical set is exactly `%` `:` space C0 (§8.3) and
+  canonicality is load-bearing for union dedup; ~30 lines in
+  `core/record`, golden-tested.
+- **CLI dispatch** — no cobra/urfave; five subcommands, near-zero flags
+  (§10.1). Stdlib `flag` + a switch in `cli/dispatch.go`.
+- **Blob similarity scoring** (`Match.Score`, §9.2) — no library: git
+  itself or a small line-hash estimator in gitio; M5 implementation
+  detail, not a dependency.
+- Replica id: stdlib `crypto/rand` (§8.5).
