@@ -15,9 +15,9 @@ var ErrNotInitialized = errors.New("not initialized — run dm init")
 
 // Session is app's per-invocation context (architecture.md §7): the lock,
 // the checkout snapshot, resumed monotonic minting, and the pending
-// overlay. The M2 subset — store tip/index, evidence wiring, and the stat
-// accumulator arrive with their milestones (no store branch yet: pending
-// alone carries reads).
+// overlay. Store tip/index, evidence wiring, and the stat accumulator
+// arrive with their milestones (no store branch yet: pending alone
+// carries reads).
 type Session struct {
 	Repo   *gitio.Repo
 	Local  *local.Dir

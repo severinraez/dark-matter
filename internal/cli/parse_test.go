@@ -67,12 +67,74 @@ func TestParseBatch(t *testing.T) {
 		{
 			name:  "handle read",
 			input: "r:#a3f9c1\n",
-			want:  []app.Command{app.CmdRead{RawText: "r:#a3f9c1", Handle: "a3f9c1"}},
+			want:  []app.Command{app.CmdRead{RawText: "r:#a3f9c1", Target: app.Ref{Handle: "a3f9c1"}}},
 		},
 		{
 			name:  "blank lines are skipped",
 			input: "\nr:foo\n\n",
 			want:  []app.Command{app.CmdRead{RawText: "r:foo", Path: "foo"}},
+		},
+		{
+			name:  "supersede with greedy body",
+			input: "u:#a3f9c1:new body: with colons\n",
+			want: []app.Command{app.CmdSupersede{
+				RawText: "u:#a3f9c1:new body: with colons",
+				Target:  app.Ref{Handle: "a3f9c1"}, Body: "new body: with colons",
+			}},
+		},
+		{
+			name:  "tombstone",
+			input: "d:#a3f9c1\n",
+			want:  []app.Command{app.CmdTombstone{RawText: "d:#a3f9c1", Target: app.Ref{Handle: "a3f9c1"}}},
+		},
+		{
+			name:  "keep in place and keep with explicit raw-colon path",
+			input: "k:#a3f9c1\nk:#a3f9c1:web/foo:1\n",
+			want: []app.Command{
+				app.CmdReAnchor{RawText: "k:#a3f9c1", Target: app.Ref{Handle: "a3f9c1"}},
+				// The k path is the final field: a raw colon survives (§9.3).
+				app.CmdReAnchor{RawText: "k:#a3f9c1:web/foo:1", Target: app.Ref{Handle: "a3f9c1"}, Path: "web/foo:1"},
+			},
+		},
+		{
+			name:  "feedback with and without reason",
+			input: "f:#a3f9c1:!:repo layer removed in v3\nf:#a3f9c1:+\n",
+			want: []app.Command{
+				app.CmdFeedback{RawText: "f:#a3f9c1:!:repo layer removed in v3",
+					Target: app.Ref{Handle: "a3f9c1"}, Sig: "!", Reason: "repo layer removed in v3"},
+				app.CmdFeedback{RawText: "f:#a3f9c1:+", Target: app.Ref{Handle: "a3f9c1"}, Sig: "+"},
+			},
+		},
+		{
+			name:  "link and unlink",
+			input: "al:#aaaaaa:#bbbbbb:schema STI\ndl:#aaaaaa:#bbbbbb\n",
+			want: []app.Command{
+				app.CmdLink{RawText: "al:#aaaaaa:#bbbbbb:schema STI",
+					From: app.Ref{Handle: "aaaaaa"}, To: app.Ref{Handle: "bbbbbb"}, Comment: "schema STI"},
+				app.CmdUnlink{RawText: "dl:#aaaaaa:#bbbbbb",
+					From: app.Ref{Handle: "aaaaaa"}, To: app.Ref{Handle: "bbbbbb"}},
+			},
+		},
+		{
+			name:  "move and remove",
+			input: "mv:api/old.rb:api/new.rb\nmv:api/:svc/\nrm:api/\n",
+			want: []app.Command{
+				app.CmdMove{RawText: "mv:api/old.rb:api/new.rb", Old: "api/old.rb", New: "api/new.rb"},
+				app.CmdMove{RawText: "mv:api/:svc/", Old: "api/", New: "svc/"},
+				app.CmdRemove{RawText: "rm:api/", Path: "api/"},
+			},
+		},
+		{
+			name:  "$N backrefs anywhere a handle goes",
+			input: "a:x.rb:c:one\na:y.rb:c:two\nal:$1:$2:related\nu:$1:revised\nr:$2\n",
+			want: []app.Command{
+				app.CmdCreate{RawText: "a:x.rb:c:one", Path: "x.rb", Subj: "c", Body: "one"},
+				app.CmdCreate{RawText: "a:y.rb:c:two", Path: "y.rb", Subj: "c", Body: "two"},
+				app.CmdLink{RawText: "al:$1:$2:related",
+					From: app.Ref{Backref: 1}, To: app.Ref{Backref: 2}, Comment: "related"},
+				app.CmdSupersede{RawText: "u:$1:revised", Target: app.Ref{Backref: 1}, Body: "revised"},
+				app.CmdRead{RawText: "r:$2", Target: app.Ref{Backref: 2}},
+			},
 		},
 	}
 	for _, tt := range tests {
@@ -99,12 +161,26 @@ func TestParseBatchRejects(t *testing.T) {
 		{"bad subject", "r:ok\na:foo:x:body\n", 2, "expected subject (c|a|d|o) after path"},
 		{"empty body", "a:foo:c:\n", 1, "empty body"},
 		{"unknown command", "q:foo\n", 1, `unknown command "q"`},
-		{"not yet implemented verb", "u:#a3f9c1:body\n", 1, `command "u" not implemented yet`},
+		{"not yet implemented verb", "s:foo:term\n", 1, `command "s" not implemented yet`},
 		{"bare percent gets the hint", "r:50%off\n", 1, `write %25`},
 		{"non-numeric depth", "r:foo:bar\n", 1, "expected numeric depth"},
 		{"too many read fields", "r:a:b:c\n", 1, "expected r:path or r:path:depth"},
 		{"ends mid-continuation", "a:x.rb:c:body\\\n", 1, "mid-continuation"},
 		{"missing colon", "sync\n", 1, "expected cmd:... form"},
+		{"empty supersede body", "u:#a3f9c1:\n", 1, "empty body"},
+		{"tombstone rejects extra field", "d:#a3f9c1:x\n", 1, "expected d:#handle"},
+		{"bad feedback signal", "f:#a3f9c1:?\n", 1, "expected signal (+|-|!)"},
+		{"empty feedback reason", "f:#a3f9c1:+:\n", 1, "empty reason"},
+		{"unlink wants exactly two handles", "dl:#aaaaaa\n", 1, "expected dl:#a:#b"},
+		{"bad ref field", "d:a3f9c1\n", 1, "expected #handle or $N"},
+		{"mv slash mismatch", "mv:api/:svc\n", 1, "must both be files or both folders"},
+		// $N violations (§11.4 two-phase): forward, out-of-range,
+		// non-create — all reject at parse.
+		{"backref forward", "u:$1:body\na:x.rb:c:note\n", 1, "$1 must reference an earlier command"},
+		{"backref out of range", "a:x.rb:c:note\nd:$9\n", 2, "$9 must reference an earlier command"},
+		{"backref self", "a:x.rb:c:note\nu:$2:body\n", 2, "$2 must reference an earlier command"},
+		{"backref non-create", "a:x.rb:c:note\nr:x.rb\nd:$2\n", 3, "$2 does not reference an a command"},
+		{"backref zero", "a:x.rb:c:note\nd:$0\n", 2, "expected $N with N ≥ 1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

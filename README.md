@@ -12,8 +12,9 @@ right commit, any merge strategy — queried through a token-efficient batch CLI
 - [architecture.md](architecture.md) — module boundaries, the Evidence port,
   core decomposition, repo layout (A§N references).
 - [plan.md](plan.md) — milestone ordering and dependency decisions.
-  **Current state: M2 (walking skeleton)** — `a`/`r` against pending only;
-  no store branch, sync, or resolution layers beyond exact-blob yet.
+  **Current state: M3 (fold + full CRUD)** — every write verb and reads
+  against pending; no store branch, sync, or resolution layers beyond
+  exact-blob yet.
 
 ## Build
 
@@ -42,9 +43,13 @@ dm help                        # subcommand overview
 ```
 
 Batch grammar is §4 of design.md: `a:path:subj:body` creates a note
-(`subj` ∈ `c`ode/`a`rch/`d`ev/`o`ps), `r:path` reads a node's surface. Use a
-quoted heredoc (`<<'EOF'`) so the shell doesn't eat `\` continuations.
-`sync`, `worklist`, and `gc` arrive with later milestones (plan.md M4+).
+(`subj` ∈ `c`ode/`a`rch/`d`ev/`o`ps); `r:path` reads a node's surface and
+`r:#handle` expands one entry; `u`/`d`/`k`/`f` supersede/tombstone/re-anchor/
+flag by handle; `al`/`dl` link and unlink entries; `mv`/`rm` relocate or
+retire whole paths; `$N` references the entry created by the batch's Nth
+command. Use a quoted heredoc (`<<'EOF'`) so the shell doesn't eat `\`
+continuations or `$N`. `sync`, `worklist`, and `gc` arrive with later
+milestones (plan.md M4+).
 
 ## Develop
 

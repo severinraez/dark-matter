@@ -6,9 +6,10 @@ import (
 	"meltcloud.io/dm/internal/core/record"
 )
 
-// The M2 read-model subset: the surface a node read returns and the write
-// acks (design.md §5.1, §4.3). Ranking, search, worklist, and the crowding
-// threshold arrive with their milestones.
+// The read-model app returns and cli renders (design.md §5.1, §4.3): the
+// surface a node read returns, the expansion a handle read returns, and
+// the write acks. Ranking, search, worklist, and the crowding threshold
+// arrive with their milestones.
 
 // EntryPreview is one own-entry line of a surface: subject, handle, the
 // body's first line, and the hidden-size hint (§5.1, §5.2).
@@ -34,6 +35,49 @@ type Surface struct {
 // Created is the `+ #handle created` ack (§4.3).
 type Created struct {
 	Handle record.Handle
+}
+
+// AckVerb names a `✓` write ack's kind (§4.3).
+type AckVerb string
+
+const (
+	AckSuperseded AckVerb = "superseded"
+	AckTombstoned AckVerb = "tombstoned"
+	AckReAnchored AckVerb = "re-anchored"
+	AckFeedback   AckVerb = "feedback"
+	AckLinked     AckVerb = "linked"
+	AckUnlinked   AckVerb = "unlinked"
+	AckMoved      AckVerb = "moved"
+)
+
+// Ack is one `✓` write acknowledgment line. Handle is the acted-on entry;
+// the other fields apply per verb: Rev for superseded, Sig for feedback,
+// To for linked/unlinked (the ack echoes minted handles, so `$N` callers
+// still learn the stable ones — §4.2).
+type Ack struct {
+	Verb   AckVerb
+	Handle record.Handle
+	To     record.Handle
+	Rev    int
+	Sig    record.Sig
+}
+
+// Expansion is the `r:#handle` result (§5.3): the full body of one entry
+// plus its links one level and relations.
+type Expansion struct {
+	Node       record.Path
+	Subj       record.Subject
+	Handle     record.Handle
+	Body       string
+	Links      []LinkPreview // outgoing, live endpoints only
+	LinkedFrom []record.Path // nodes whose entries link here, deduped
+}
+
+// LinkPreview is one collapsed link line item: the target's handle and the
+// link's optional comment.
+type LinkPreview struct {
+	Handle  record.Handle
+	Comment string
 }
 
 // Preview builds the one-line preview of an entry body.
