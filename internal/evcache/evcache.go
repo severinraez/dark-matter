@@ -4,11 +4,14 @@
 // interfaces (architecture.md §2, §5). Core stays cache-oblivious; deleting
 // .git/.dm/cache/ must be unobservable to core-level results.
 //
-// M5 carries the similarity memos: RenamePairs results persist under
-// `match-<origin>-<checkout-tree>` (§8.2). The working tree has no stable
+// Two persistent memos live below the port (architecture.md §5 decision
+// 4): the similarity memos — RenamePairs results under
+// `match-<origin>-<checkout-tree>` (§8.2; the working tree has no stable
 // key to memoize under, so a dirty checkout bypasses the persistent layer —
-// gitio's own in-memory per-invocation memo still applies. The ff-aware
-// unreachability cache (Lineage role) arrives with M6.
+// gitio's own in-memory per-invocation memo still applies) — and the
+// ff-aware unreachability cache on the Lineage role (unreach.go). The
+// `nomatch-<tip>-<target-tip>` memo caches a core conclusion, not a raw
+// query, and sits above the port in app.
 package evcache
 
 import (
@@ -124,7 +127,27 @@ func decodePairs(payload []byte) ([]evidence.RenamePair, error) {
 func takeUvarint(b []byte) (uint64, []byte, error) {
 	v, n := binary.Uvarint(b)
 	if n <= 0 {
-		return 0, nil, errors.New("bad uvarint in match memo")
+		return 0, nil, errors.New("bad uvarint in cache payload")
 	}
 	return v, b[n:], nil
+}
+
+func appendUvarintLen(b []byte, n int) []byte {
+	return binary.AppendUvarint(b, uint64(n))
+}
+
+func appendString(b []byte, s string) []byte {
+	b = binary.AppendUvarint(b, uint64(len(s)))
+	return append(b, s...)
+}
+
+func takeString(b []byte) (string, []byte, error) {
+	l, b, err := takeUvarint(b)
+	if err != nil {
+		return "", nil, err
+	}
+	if uint64(len(b)) < l {
+		return "", nil, errors.New("truncated cache payload")
+	}
+	return string(b[:l]), b[l:], nil
 }

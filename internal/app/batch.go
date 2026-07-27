@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"meltcloud.io/dm/internal/core/fold"
+	"meltcloud.io/dm/internal/core/lineage"
 	"meltcloud.io/dm/internal/core/record"
 	"meltcloud.io/dm/internal/core/resolve"
 	"meltcloud.io/dm/internal/core/view"
@@ -53,6 +54,13 @@ func (s *Session) ExecuteBatch(cmds []Command) (BatchResult, error) {
 	if err != nil {
 		return BatchResult{}, err
 	}
+	// The heavy matchers also fire at reads after a fetch — memoized per
+	// (tip, target-tip), so this is cheap whenever nothing changed
+	// (architecture.md §7 decision 5). Forced-update pairs exist only at
+	// fetch time; sync passes them in.
+	if err := ex.mintPass(nil); err != nil {
+		return BatchResult{}, err
+	}
 	var res BatchResult
 	for i, cmd := range cmds {
 		b := Block{Echo: cmd.Raw()}
@@ -81,6 +89,8 @@ func (s *Session) ExecuteBatch(cmds []Command) (BatchResult, error) {
 			b.Macro, b.Err = ex.move(c)
 		case CmdRemove:
 			b.Macro, b.Err = ex.remove(c)
+		case CmdVerdict:
+			b.Ack, b.Err = ex.verdict(c)
 		default:
 			return BatchResult{}, fmt.Errorf("unknown command type %T", cmd)
 		}
@@ -106,32 +116,51 @@ type executor struct {
 	s        *Session
 	ev       *evcache.Cached                    // the wired Evidence value (architecture.md §2)
 	records  map[record.EntryID][]record.Record // per-entry CR/SU/TB/RA/RP/FB
+	verdicts []record.Record                    // VD records, whole-store
 	linkRecs []record.Record                    // LN/UL, folded on demand
 	order    []record.EntryID                   // creation (rec-id) order
 	handles  map[record.EntryID]record.Handle
 	taken    map[record.Handle]bool
-	landed   map[record.SHA]bool // rule-(b) memo, valid for this HEAD
+	bindings map[record.SHA]record.SHA             // winning landed bindings memo; nil after invalidation
+	class    map[record.SHA]lineage.Classification // rule-(b) memo, valid for this snapshot
 	folded   map[record.EntryID]fold.Entry
 	resolved map[record.EntryID]resolve.Resolution // rule-(a) memo per entry
 	links    []fold.Link                           // memo over linkRecs; nil after invalidation
 	made     map[int]record.EntryID                // $N → the entry command N created
 }
 
+// newExecutor builds the read machinery and runs the m1 mint — the cheap
+// reflog scan that fires at any read-bearing invocation (architecture.md
+// §7: batch = Open → m1 mint → execute).
 func (s *Session) newExecutor() (*executor, error) {
+	ex, err := s.newExecutorFrom(s.View())
+	if err != nil {
+		return nil, err
+	}
+	if err := ex.mintM1(); err != nil {
+		return nil, err
+	}
+	return ex, nil
+}
+
+// newExecutorFrom builds the machinery over an explicit record view — the
+// sync mint pass reads the post-fetch tip while the session keeps its
+// pre-fetch mirror for the epoch rule (§8.4).
+func (s *Session) newExecutorFrom(view []record.Record) (*executor, error) {
 	ex := &executor{
 		s:        s,
 		ev:       evcache.New(s.Repo.Evidence(s.Head), s.Local),
 		records:  make(map[record.EntryID][]record.Record),
 		handles:  make(map[record.EntryID]record.Handle),
 		taken:    make(map[record.Handle]bool),
-		landed:   make(map[record.SHA]bool),
+		class:    make(map[record.SHA]lineage.Classification),
 		folded:   make(map[record.EntryID]fold.Entry),
 		resolved: make(map[record.EntryID]resolve.Resolution),
 		made:     make(map[int]record.EntryID),
 	}
 	// Replay store ∪ pending in rec-id order so handle extension resolves
 	// exactly as it did at each mint (§3.5).
-	for _, rec := range s.View() {
+	for _, rec := range view {
 		if err := ex.absorb(rec); err != nil {
 			return nil, err
 		}
@@ -167,9 +196,15 @@ func (ex *executor) absorb(rec record.Record) error {
 	case record.Link, record.Unlink:
 		ex.linkRecs = append(ex.linkRecs, rec)
 		ex.links = nil
+	case record.Verdict:
+		// A verdict can change every origin's classification (chains), so
+		// the rule-(b) memos and everything folded over them invalidate.
+		ex.verdicts = append(ex.verdicts, rec)
+		ex.bindings = nil
+		ex.class = make(map[record.SHA]lineage.Classification)
+		ex.folded = make(map[record.EntryID]fold.Entry)
+		ex.resolved = make(map[record.EntryID]resolve.Resolution)
 	}
-	// Other types (VD) play no role in the entry fold; dump still prints
-	// them from Pending.
 	return nil
 }
 
@@ -195,14 +230,30 @@ func (ex *executor) commit(rec record.Record) error {
 }
 
 // fold returns the entry state this checkout reads, classifying each
-// record's origin against HEAD first — rule (b) consumed per record as
-// data-in (architecture.md §6).
+// record's origin first — rule (b) consumed per record as data-in
+// (architecture.md §6), chain-aware through verdict records (§9.4).
 func (ex *executor) fold(id record.EntryID) (fold.Entry, error) {
 	if e, ok := ex.folded[id]; ok {
 		return e, nil
 	}
 	recs := ex.records[id]
-	landed := make(map[record.SHA]bool)
+	class, err := ex.classify(recordOrigins(recs))
+	if err != nil {
+		return fold.Entry{}, err
+	}
+	landed := make(map[record.SHA]bool, len(class))
+	for origin, c := range class {
+		landed[origin] = c.State == lineage.Landed
+	}
+	e := fold.Fold(id, recs, landed)
+	ex.folded[id] = e
+	return e, nil
+}
+
+// recordOrigins lists the distinct origins of fold-participating records.
+func recordOrigins(recs []record.Record) []record.SHA {
+	var out []record.SHA
+	seen := make(map[record.SHA]bool)
 	for _, r := range recs {
 		var origin record.SHA
 		switch v := r.(type) {
@@ -217,27 +268,70 @@ func (ex *executor) fold(id record.EntryID) (fold.Entry, error) {
 		default:
 			continue
 		}
-		ok, err := ex.landedInHead(origin)
-		if err != nil {
-			return fold.Entry{}, err
+		if !seen[origin] {
+			seen[origin] = true
+			out = append(out, origin)
 		}
-		landed[origin] = ok
 	}
-	e := fold.Fold(id, recs, landed)
-	ex.folded[id] = e
-	return e, nil
+	return out
 }
 
-func (ex *executor) landedInHead(origin record.SHA) (bool, error) {
-	if v, ok := ex.landed[origin]; ok {
-		return v, nil
+// landedBindings folds the VD set to the winning origin → landed-as map,
+// memoized until a verdict is absorbed.
+func (ex *executor) landedBindings() map[record.SHA]record.SHA {
+	if ex.bindings == nil {
+		ex.bindings = lineage.LandedBindings(lineage.WinningVerdicts(ex.verdicts))
 	}
-	v, err := ex.s.Repo.IsAncestor(origin, ex.s.Head)
+	return ex.bindings
+}
+
+// classify runs the §9.4 fold over origins, memoized per snapshot; only
+// the not-yet-classified remainder hits the evidence.
+func (ex *executor) classify(origins []record.SHA) (map[record.SHA]lineage.Classification, error) {
+	out := make(map[record.SHA]lineage.Classification, len(origins))
+	var missing []record.SHA
+	for _, o := range origins {
+		if c, ok := ex.class[o]; ok {
+			out[o] = c
+		} else {
+			missing = append(missing, o)
+		}
+	}
+	if len(missing) > 0 {
+		fresh, err := lineage.Classify(ex.ev, ex.landedBindings(), ex.s.Qualified, missing)
+		if err != nil {
+			return nil, err
+		}
+		for o, c := range fresh {
+			ex.class[o] = c
+			out[o] = c
+		}
+	}
+	return out, nil
+}
+
+// entryLineage is an entry's rule-(b) state — the best across its records
+// (§8.3): any landed → landed; else any pending-elsewhere → pending;
+// else unknown beats abandoned (a degraded clone never judges).
+func (ex *executor) entryLineage(id record.EntryID) (lineage.State, error) {
+	class, err := ex.classify(recordOrigins(ex.records[id]))
 	if err != nil {
-		return false, err
+		return lineage.Abandoned, err
 	}
-	ex.landed[origin] = v
-	return v, nil
+	best := lineage.Abandoned
+	for _, c := range class {
+		switch c.State {
+		case lineage.Landed:
+			return lineage.Landed, nil
+		case lineage.PendingElsewhere:
+			best = lineage.PendingElsewhere
+		case lineage.Unknown:
+			if best == lineage.Abandoned {
+				best = lineage.Unknown
+			}
+		}
+	}
+	return best, nil
 }
 
 func (ex *executor) linkSet() []fold.Link {
@@ -317,6 +411,18 @@ func (ex *executor) resolve(ref Ref, repair bool) (record.EntryID, string) {
 			dead = append(dead, id)
 		case e.Landed:
 			alive = append(alive, id)
+		case repair:
+			// Abandoned entries are addressable by the repair verbs from
+			// the worklist (§5.3, §9.6 — that is how a dead line's note is
+			// rescued or retired); pending-elsewhere and unknown stay
+			// indistinguishable from nonexistent.
+			ls, err := ex.entryLineage(id)
+			if err != nil {
+				return record.EntryID{}, err.Error()
+			}
+			if ls == lineage.Abandoned {
+				alive = append(alive, id)
+			}
 		}
 	}
 	if !repair {
@@ -526,6 +632,12 @@ func (ex *executor) supersede(c CmdSupersede) (*view.Ack, string) {
 	if err != nil {
 		return nil, err.Error()
 	}
+	if !e.Landed {
+		// An abandoned entry has no resolved home to restamp at — rescue
+		// it first, then rewrite (§8.3 rescue fold).
+		h := ex.handles[id]
+		return nil, fmt.Sprintf("#%s abandoned — rescue with k:#%s:path first, or retire with d", h, h)
+	}
 	path, msg := ex.restampPath(id)
 	if msg != "" {
 		return nil, msg
@@ -583,19 +695,23 @@ func (ex *executor) reAnchor(c CmdReAnchor) (*view.Ack, string) {
 	if msg != "" {
 		return nil, msg
 	}
+	e, err := ex.fold(id)
+	if err != nil {
+		return nil, err.Error()
+	}
 	path := c.Path
 	if path == "" {
+		if !e.Landed {
+			h := ex.handles[id]
+			return nil, fmt.Sprintf("#%s abandoned — name the new home: k:#%s:path", h, h)
+		}
 		if path, msg = ex.restampPath(id); msg != "" {
 			return nil, msg
 		}
-	} else {
-		e, err := ex.fold(id)
-		if err != nil {
-			return nil, err.Error()
-		}
-		if e.Anchor.IsPath() != path.IsFolder() {
-			return nil, fmt.Sprintf("#%s: entry and target disagree on file vs folder (trailing /)", ex.handles[id])
-		}
+	} else if e.Landed && e.Anchor.IsPath() != path.IsFolder() {
+		// An abandoned rescue has no landed anchor to compare kinds with —
+		// the named path decides (§8.3: k mints an RA with a live origin).
+		return nil, fmt.Sprintf("#%s: entry and target disagree on file vs folder (trailing /)", ex.handles[id])
 	}
 	anchor, msg := ex.stampAnchor(path)
 	if msg != "" {
@@ -801,6 +917,74 @@ func (ex *executor) remove(c CmdRemove) ([]MacroItem, string) {
 		items = append(items, MacroItem{Ack: view.Ack{Verb: view.AckTombstoned, Handle: ex.handles[id]}})
 	}
 	return items, ""
+}
+
+// verdict executes `vd` (§9.4): manual landing disposition, stamped m5.
+// The subject bulk-binds its whole segment when its objects are locally
+// reachable — every store ∪ pending origin and chained landed-as commit in
+// (merge-base..subject] gets a VD — or binds/voids the single origin
+// otherwise (the evidence-destroyed case, §11.4). Manual judgment
+// overrides inference: existing bindings lose by LWW, and the ladder never
+// re-mints over a winning verdict.
+func (ex *executor) verdict(c CmdVerdict) (*view.Ack, string) {
+	subject, msg := ex.resolveSHA(c.Subject)
+	if msg != "" {
+		return nil, msg
+	}
+	if !c.Landed {
+		if err := ex.mintVerdict(record.Verdict{Origin: subject}); err != nil {
+			return nil, err.Error()
+		}
+		return &view.Ack{Verb: view.AckVdUnlanded, Subject: subject}, ""
+	}
+	landedAs, msg := ex.resolveSHA(c.LandedAs)
+	if msg != "" {
+		return nil, msg
+	}
+	if subject == landedAs {
+		return nil, "vd: subject and landed-as are the same commit"
+	}
+	// Bulk-bind when the segment is enumerable (both endpoints local).
+	bound := []lineage.Binding{{Origin: subject, LandedAs: landedAs, Matcher: record.MatcherManual}}
+	if ex.hasCommit(subject) && ex.hasCommit(landedAs) {
+		candidates := append(ex.bindCandidates(true), subject)
+		bindings, err := lineage.BindSegment(ex.ev, subject, landedAs, candidates, record.MatcherManual)
+		if err != nil {
+			return nil, err.Error()
+		}
+		if len(bindings) > 0 {
+			bound = bindings
+		}
+	}
+	for _, b := range bound {
+		if err := ex.mintVerdict(record.Verdict{Origin: b.Origin, Landed: true, LandedAs: b.LandedAs, Matcher: b.Matcher}); err != nil {
+			return nil, err.Error()
+		}
+	}
+	return &view.Ack{Verb: view.AckVdLanded, Subject: landedAs, Count: len(bound)}, ""
+}
+
+// resolveSHA expands a (possibly abbreviated) commit sha against the local
+// odb; an unknown full-length sha passes verbatim — a degraded clone may
+// judge origins it never fetched (§9.4 m5) — while an unknown abbreviation
+// errors, since dm cannot know which commit it names.
+func (ex *executor) resolveSHA(sha record.SHA) (record.SHA, string) {
+	full, err := ex.s.Repo.ResolveCommit(sha)
+	if err != nil {
+		return "", err.Error()
+	}
+	if full != nil {
+		return *full, ""
+	}
+	if len(sha) < 40 {
+		return "", fmt.Sprintf("%s: unknown commit (abbreviated — use the full sha for commits this clone lacks)", sha)
+	}
+	return sha, ""
+}
+
+func (ex *executor) hasCommit(sha record.SHA) bool {
+	full, err := ex.s.Repo.ResolveCommit(sha)
+	return err == nil && full != nil
 }
 
 // stageBlobIfUncommitted stages described bytes the odb lacks to

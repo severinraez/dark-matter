@@ -13,15 +13,14 @@ import (
 	"meltcloud.io/dm/internal/core/record"
 )
 
-// Evidence is gitio's implementation of the evidence.Tree and
-// evidence.Match roles (architecture.md §5), bound to one checkout snapshot
-// (HEAD + working tree) for one locked invocation. The Lineage role and the
-// rewrite-forensics half of Match (reflog, patch-ids, segments) arrive with
-// M6 — their methods error until then; core's M5 consumers never call them.
+// Evidence is gitio's implementation of all three evidence roles
+// (architecture.md §5) — Tree, Match (evidence.go, forensics.go), and
+// Lineage (forensics.go) — bound to one checkout snapshot (HEAD + working
+// tree) for one locked invocation.
 //
 // Faithful and policy-free: rename/copy detection runs at a hardwired
 // generous floor (renameFloor) and returns raw scores; every band, margin,
-// and guard lives in core/resolve.
+// floor, and action filter lives in core.
 type Evidence struct {
 	repo *Repo
 	head record.SHA
@@ -33,9 +32,10 @@ type Evidence struct {
 	clean    bool // no status dirt: the manifest equals HEAD's tree
 	loaded   bool
 
-	pairs   map[record.SHA][]evidence.RenamePair // per-origin diff memo
-	treeAt  map[string]*evidence.TreeFP          // (commit,path) memo
-	headTop map[record.SHA][]record.Path         // tree SHA → HEAD dirs, lazy
+	pairs    map[record.SHA][]evidence.RenamePair // per-origin diff memo
+	treeAt   map[string]*evidence.TreeFP          // (commit,path) memo
+	headTop  map[record.SHA][]record.Path         // tree SHA → HEAD dirs, lazy
+	patchIDs map[record.SHA]*evidence.PatchID     // per-commit patch-id memo
 
 	// BlobSource supplies anchored-blob bytes the object database lacks —
 	// a not-yet-synced dirty anchor staged under pending/blobs (§8.1).
@@ -52,15 +52,20 @@ const renameFloor = 25
 // tree.
 func (r *Repo) Evidence(head record.SHA) *Evidence {
 	return &Evidence{
-		repo:   r,
-		head:   head,
-		pairs:  make(map[record.SHA][]evidence.RenamePair),
-		treeAt: make(map[string]*evidence.TreeFP),
+		repo:     r,
+		head:     head,
+		pairs:    make(map[record.SHA][]evidence.RenamePair),
+		treeAt:   make(map[string]*evidence.TreeFP),
+		patchIDs: make(map[record.SHA]*evidence.PatchID),
 	}
 }
 
 // Head returns the snapshot's HEAD commit.
 func (e *Evidence) Head() record.SHA { return e.head }
+
+// Repo exposes the underlying repository for adapter-layer composition
+// (evcache's revalidation plumbing); core never sees it.
+func (e *Evidence) Repo() *Repo { return e.repo }
 
 // HeadTree returns HEAD's tree SHA — the checkout half of the match-memo
 // key (§8.2).
@@ -328,18 +333,6 @@ func similarity(a, b []byte) int {
 	return 100 * common / max
 }
 
-// ---- M6 forensics stubs (evidence.Match completeness) ----
-
-var errM6 = errors.New("gitio: rewrite forensics arrive with M6")
-
-func (e *Evidence) ReflogEntries() ([]evidence.ReflogEntry, error)          { return nil, errM6 }
-func (e *Evidence) MergeBase(a, b record.SHA) (*record.SHA, error)          { return nil, errM6 }
-func (e *Evidence) Segment(base, tip record.SHA) ([]evidence.Commit, error) { return nil, errM6 }
-func (e *Evidence) PatchID(commit record.SHA) (*evidence.PatchID, error)    { return nil, errM6 }
-func (e *Evidence) RangePatchID(base, tip record.SHA) (*evidence.RangeID, error) {
-	return nil, errM6
-}
-
 // ---- checkout manifest ----
 
 // load builds the manifest once: HEAD's tree overlaid with status dirt
@@ -464,6 +457,7 @@ func isMissingObject(err error) bool {
 	for _, marker := range []string{
 		"bad object", "unknown revision", "Not a valid object name",
 		"invalid object name", "bad revision", "bad file", "does not exist in",
+		"no such commit", "malformed object name", "Not a valid commit name",
 	} {
 		if strings.Contains(msg, marker) {
 			return true

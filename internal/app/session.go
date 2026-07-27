@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"meltcloud.io/dm/internal/core/record"
 	"meltcloud.io/dm/internal/core/union"
@@ -31,6 +32,11 @@ type Session struct {
 	// tip only moves at dm sync (§8.2), which holds this same lock.
 	StoreTip *record.SHA
 	StoreSet union.Set
+
+	// Qualified is the §9.4 clone guard: full history (not shallow) and an
+	// all-refs fetch refspec. Degraded clones consume existing bindings
+	// but never infer verdicts or classify abandoned.
+	Qualified bool
 
 	// Pending is the overlay in rec-id (fold) order; writes within the
 	// batch append here too, so later commands read earlier writes.
@@ -78,6 +84,9 @@ func (s *Session) load() error {
 		return err
 	}
 	s.Head = head
+	if s.Qualified, err = qualified(s.Repo); err != nil {
+		return err
+	}
 	if s.StoreTip, err = s.Store.Tip(); err != nil {
 		return err
 	}
@@ -141,4 +150,30 @@ func (s *Session) Close() {
 		s.release()
 		s.release = nil
 	}
+}
+
+// qualified assembles the §9.4 clone-guard facts: not shallow, and — when
+// a share remote exists — a fetch refspec covering all of refs/heads/*
+// (`--single-branch` narrows it to one branch). A remoteless clone is its
+// own authority. Conservative in the right direction: an unqualified
+// reader under-shows, it never mass-condemns.
+func qualified(repo *gitio.Repo) (bool, error) {
+	shallow, err := repo.IsShallow()
+	if err != nil || shallow {
+		return false, err
+	}
+	remote, err := shareRemote(repo)
+	if err != nil || remote == "" {
+		return err == nil, err
+	}
+	specs, err := repo.ConfigValues("remote." + remote + ".fetch")
+	if err != nil {
+		return false, err
+	}
+	for _, spec := range specs {
+		if strings.Contains(spec, "refs/heads/*") {
+			return true, nil
+		}
+	}
+	return false, nil
 }

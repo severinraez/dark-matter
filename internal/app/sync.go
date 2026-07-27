@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 
 	"meltcloud.io/dm/internal/core/record"
 	"meltcloud.io/dm/internal/core/union"
@@ -23,6 +24,47 @@ type SyncOptions struct {
 	SkipFetch bool
 }
 
+// mintForSync runs the load-bearing mint moment (§9.4): m1 plus the heavy
+// matchers over the post-fetch store ∪ pending, right after fetch — while
+// the author's clone holds both the local branch refs (the evidence) and
+// the fresh target line, before forge branch auto-delete and GC destroy
+// the evidence. Degraded clones never mint.
+func (s *Session) mintForSync(pairs []forcedUpdate) error {
+	if !s.Qualified {
+		return nil
+	}
+	tip, err := s.Store.Tip()
+	if err != nil {
+		return err
+	}
+	set, err := s.Store.Read(tip)
+	if err != nil {
+		return err
+	}
+	view := make([]record.Record, 0, len(set.Records)+len(s.Pending))
+	for id, data := range set.Records {
+		rec, err := record.Decode(data)
+		if err != nil {
+			return fmt.Errorf("store record %s: %w", id, err)
+		}
+		view = append(view, rec)
+	}
+	for _, rec := range s.Pending {
+		if _, inStore := set.Records[rec.ID()]; !inStore {
+			view = append(view, rec)
+		}
+	}
+	sort.Slice(view, func(i, j int) bool { return view[i].ID().Less(view[j].ID()) })
+	ex, err := s.newExecutorFrom(view)
+	if err != nil {
+		return err
+	}
+	if err := ex.mintM1(); err != nil {
+		return err
+	}
+	return ex.mintPass(pairs)
+}
+
 // maxPushAttempts bounds the retry loop. Each retry only ever adds, so a
 // lost race converges on the next attempt; hitting the bound means the
 // remote is advancing faster than we can fetch, and erroring out beats
@@ -30,12 +72,14 @@ type SyncOptions struct {
 const maxPushAttempts = 5
 
 // Sync is `dm sync` (§8.4), the one git-facing verb: fetch (refs/dm/store
-// + code refs) → fold pending into a candidate store commit → CRDT union
-// merge → push, with a fetch-merge-retry loop on a non-fast-forward race.
-// Pending clears only on a successful push; a failed push degrades to
-// fetch-only — the fetch and union merge have already applied locally, so
-// a read-only-remote clone gets receive-only behavior plus an error line,
-// losing nothing. (The mint pass joins in M6, between fetch and fold.)
+// + code refs) → mint pass (§9.4: attempt landings while the evidence —
+// local branch refs plus the fresh target line — is at hand; verdicts
+// append to pending) → fold pending into a candidate store commit → CRDT
+// union merge → push, with a fetch-merge-retry loop on a non-fast-forward
+// race. Pending clears only on a successful push; a failed push degrades
+// to fetch-only — the fetch and union merge have already applied locally,
+// so a read-only-remote clone gets receive-only behavior plus an error
+// line, losing nothing.
 func Sync(dir string, det Determinism, opts SyncOptions, stdout, stderr io.Writer) error {
 	s, err := OpenSession(dir, det, stderr)
 	if err != nil {
@@ -47,6 +91,7 @@ func Sync(dir string, det Determinism, opts SyncOptions, stdout, stderr io.Write
 	if err != nil {
 		return err
 	}
+	var pairs []forcedUpdate
 	if remote != "" {
 		// The refspec is normally init's job; re-ensure so a remote added
 		// after init still syncs.
@@ -54,10 +99,31 @@ func Sync(dir string, det Determinism, opts SyncOptions, stdout, stderr io.Write
 			return err
 		}
 		if !opts.SkipFetch {
+			// Remote-tracking rewrites across the fetch are the m1r
+			// candidate pairs — they exist only at this moment (§9.4).
+			before, err := s.Repo.RefSnapshot()
+			if err != nil {
+				return err
+			}
 			if err := s.Repo.Fetch(remote); err != nil {
 				return fmt.Errorf("sync: fetch %s: %w", remote, err)
 			}
+			after, err := s.Repo.RefSnapshot()
+			if err != nil {
+				return err
+			}
+			if pairs, err = forcedUpdates(s.Repo, before, after); err != nil {
+				return err
+			}
 		}
+	}
+
+	// Mint pass, over the post-fetch store ∪ pending — the fetched tip may
+	// carry late-syncing origins; the session's own mirror stays pre-fetch
+	// for the epoch rule below. Minted verdicts land in pending and ride
+	// this same sync's push (§11.4 mint-pass-order).
+	if err := s.mintForSync(pairs); err != nil {
+		return err
 	}
 
 	// Own contribution: everything pending, as canonical bytes.

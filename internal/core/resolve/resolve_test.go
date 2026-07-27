@@ -80,10 +80,10 @@ func (f *fakeMatch) Score(blob record.SHA, candidates []record.Path) (map[record
 
 var errForensics = errors.New("forensics are not resolution's business")
 
-func (f *fakeMatch) ReflogEntries() ([]evidence.ReflogEntry, error)     { return nil, errForensics }
-func (f *fakeMatch) MergeBase(a, b record.SHA) (*record.SHA, error)     { return nil, errForensics }
-func (f *fakeMatch) Segment(a, b record.SHA) ([]evidence.Commit, error) { return nil, errForensics }
-func (f *fakeMatch) PatchID(c record.SHA) (*evidence.PatchID, error)    { return nil, errForensics }
+func (f *fakeMatch) ReflogEntries() ([]evidence.ReflogEntry, error)  { return nil, errForensics }
+func (f *fakeMatch) MergeBase(a, b record.SHA) (*record.SHA, error)  { return nil, errForensics }
+func (f *fakeMatch) Segment(a, b record.SHA) ([]record.SHA, error)   { return nil, errForensics }
+func (f *fakeMatch) PatchID(c record.SHA) (*evidence.PatchID, error) { return nil, errForensics }
 func (f *fakeMatch) RangePatchID(a, b record.SHA) (*evidence.RangeID, error) {
 	return nil, errForensics
 }

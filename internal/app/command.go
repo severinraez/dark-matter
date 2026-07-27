@@ -113,6 +113,18 @@ type CmdRemove struct {
 	Path    record.Path
 }
 
+// CmdVerdict is `vd:sha1:landed:sha2` | `vd:sha1:unlanded` (§9.4): manual
+// landing disposition (m5) — the subject is a line tip when its objects
+// are still reachable (bulk-binds the whole segment) or a single origin
+// otherwise; `unlanded` voids a wrong binding. Explicit agent judgment,
+// allowed from any clone, degraded included.
+type CmdVerdict struct {
+	RawText  string
+	Subject  record.SHA
+	Landed   bool
+	LandedAs record.SHA // set iff Landed
+}
+
 func (c CmdCreate) Raw() string    { return c.RawText }
 func (c CmdRead) Raw() string      { return c.RawText }
 func (c CmdSupersede) Raw() string { return c.RawText }
@@ -123,3 +135,4 @@ func (c CmdLink) Raw() string      { return c.RawText }
 func (c CmdUnlink) Raw() string    { return c.RawText }
 func (c CmdMove) Raw() string      { return c.RawText }
 func (c CmdRemove) Raw() string    { return c.RawText }
+func (c CmdVerdict) Raw() string   { return c.RawText }

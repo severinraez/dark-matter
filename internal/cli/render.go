@@ -64,6 +64,14 @@ func renderAck(w io.Writer, a view.Ack) {
 		fmt.Fprintf(w, "%s #%s feedback %s\n", glyphOK, a.Handle, a.Sig)
 	case view.AckLinked, view.AckUnlinked:
 		fmt.Fprintf(w, "%s #%s → #%s %s\n", glyphOK, a.Handle, a.To, a.Verb)
+	case view.AckVdLanded:
+		origins := "origins"
+		if a.Count == 1 {
+			origins = "origin"
+		}
+		fmt.Fprintf(w, "%s vd landed %s · %d %s bound\n", glyphOK, a.Subject, a.Count, origins)
+	case view.AckVdUnlanded:
+		fmt.Fprintf(w, "%s vd unlanded %s\n", glyphOK, a.Subject)
 	default: // tombstoned · re-anchored · moved
 		fmt.Fprintf(w, "%s #%s %s\n", glyphOK, a.Handle, a.Verb)
 	}
@@ -177,8 +185,9 @@ func renderExpansion(w io.Writer, e *view.Expansion) {
 }
 
 // renderWorklist writes the hygiene report (§9.6): one line per entry
-// wanting judgment, evidence attached, and a count footer. Golden format
-// pinned by tests.
+// wanting judgment, evidence attached; one line per abandoned line group
+// (`tip · branch hint · note count · matcher hint` — §9.4, one vd repairs
+// the group); and a count footer. Golden format pinned by tests.
 func renderWorklist(w io.Writer, r *view.WorklistReport) {
 	for _, it := range r.Items {
 		fmt.Fprintf(w, "#%s %s %s", it.Handle, it.Subj, record.EncodePath(it.Path))
@@ -198,9 +207,22 @@ func renderWorklist(w io.Writer, r *view.WorklistReport) {
 		}
 		fmt.Fprintln(w)
 	}
-	if len(r.Items) == 0 {
+	for _, g := range r.Groups {
+		notes := "notes"
+		if len(g.Handles) == 1 {
+			notes = "note"
+		}
+		handles := make([]string, len(g.Handles))
+		for i, h := range g.Handles {
+			handles[i] = "#" + string(h)
+		}
+		fmt.Fprintf(w, "line %s · no ref · %d %s (%s) · %s · vd:%s:landed:<sha> repairs\n",
+			g.Tip, len(g.Handles), notes, strings.Join(handles, " "), g.Hint, g.Tip)
+	}
+	total := len(r.Items) + len(r.Groups)
+	if total == 0 {
 		fmt.Fprintln(w, "worklist clean")
 		return
 	}
-	fmt.Fprintf(w, "%d to review\n", len(r.Items))
+	fmt.Fprintf(w, "%d to review\n", total)
 }

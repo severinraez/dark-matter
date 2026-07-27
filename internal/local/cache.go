@@ -64,6 +64,26 @@ func (d *Dir) WriteCache(key string, payload []byte) error {
 	return os.Rename(tmp.Name(), filepath.Join(d.cacheDir(), key))
 }
 
+// ListCache lists the cache keys with the given prefix, sorted. Callers
+// treat the result as advisory — entries may vanish or be stale-format;
+// ReadCache remains the arbiter.
+func (d *Dir) ListCache(prefix string) ([]string, error) {
+	entries, err := os.ReadDir(d.cacheDir())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var keys []string
+	for _, e := range entries {
+		if name := e.Name(); strings.HasPrefix(name, prefix) && !strings.HasPrefix(name, "tmp-") {
+			keys = append(keys, name)
+		}
+	}
+	return keys, nil
+}
+
 // DropCache removes cache entries with the given key prefix for which keep
 // returns false — the opportunistic GC hook for non-matching keys (§8.2).
 // Best-effort.

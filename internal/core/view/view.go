@@ -86,18 +86,23 @@ const (
 	AckLinked     AckVerb = "linked"
 	AckUnlinked   AckVerb = "unlinked"
 	AckMoved      AckVerb = "moved"
+	AckVdLanded   AckVerb = "vd-landed"
+	AckVdUnlanded AckVerb = "vd-unlanded"
 )
 
 // Ack is one `✓` write acknowledgment line. Handle is the acted-on entry;
 // the other fields apply per verb: Rev for superseded, Sig for feedback,
 // To for linked/unlinked (the ack echoes minted handles, so `$N` callers
-// still learn the stable ones — §4.2).
+// still learn the stable ones — §4.2), Subject + Count for vd (the ack
+// reports the bound-origin count, §9.4).
 type Ack struct {
-	Verb   AckVerb
-	Handle record.Handle
-	To     record.Handle
-	Rev    int
-	Sig    record.Sig
+	Verb    AckVerb
+	Handle  record.Handle
+	To      record.Handle
+	Rev     int
+	Sig     record.Sig
+	Subject record.SHA
+	Count   int
 }
 
 // Expansion is the `r:#handle` result (§5.3): the full body of one entry
@@ -132,10 +137,26 @@ type WorklistItem struct {
 	Runners []resolve.Candidate
 }
 
-// WorklistReport is the hygiene query's result (§9.6). Session scoping and
-// the abandoned/lineage groups arrive with M6/M7.
+// WorklistGroup is one abandoned line (§9.6): entries whose origins died
+// with a rewritten line, grouped so a single `vd` disposition repairs the
+// whole group — verdict repair is O(lines), not O(notes) (§9.4).
+type WorklistGroup struct {
+	// Tip is the newest origin of the group — the sha a `vd:tip:landed:…`
+	// disposition bulk-binds.
+	Tip record.SHA
+	// Handles lists the group's entries, creation order.
+	Handles []record.Handle
+	// Hint is the matcher hint: why inference could not bind (a memoized
+	// failed attempt on this line), or "no evidence".
+	Hint string
+}
+
+// WorklistReport is the hygiene query's result (§9.6). Session scoping
+// arrives with M7.
 type WorklistReport struct {
 	Items []WorklistItem
+	// Abandoned lines, grouped, deterministic order (§9.4/§9.6).
+	Groups []WorklistGroup
 }
 
 // Preview builds the one-line preview of an entry body.

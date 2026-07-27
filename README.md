@@ -12,10 +12,13 @@ right commit, any merge strategy — queried through a token-efficient batch CLI
 - [architecture.md](architecture.md) — module boundaries, the Evidence port,
   core decomposition, repo layout (A§N references).
 - [plan.md](plan.md) — milestone ordering and dependency decisions.
-  **Current state: M4 (store + sync)** — every write verb, reads against
-  store ∪ pending, and `dm sync` (shared `refs/dm/store` branch, CRDT
-  union merge, push retry, fetch-only degradation); no mint pass or
-  resolution layers beyond exact-blob yet.
+  **Current state: M6 (rule (b): lineage + ladder)** — every write verb
+  incl. `vd`, reads against store ∪ pending, full rule-(a) resolution
+  (layers 1–5, folder follow votes), `dm sync` with the §9.4 mint pass
+  (m1 reflog / m2 replay / m3 squash matchers, verdict records), derived
+  abandoned + the unreachability cache, and `dm worklist` with
+  abandoned-line grouping. Gate verdicts on record: [q1-report.md](q1-report.md),
+  [q3-report.md](q3-report.md).
 
 ## Build
 
@@ -49,11 +52,14 @@ Batch grammar is §4 of design.md: `a:path:subj:body` creates a note
 (`subj` ∈ `c`ode/`a`rch/`d`ev/`o`ps); `r:path` reads a node's surface and
 `r:#handle` expands one entry; `u`/`d`/`k`/`f` supersede/tombstone/re-anchor/
 flag by handle; `al`/`dl` link and unlink entries; `mv`/`rm` relocate or
-retire whole paths; `$N` references the entry created by the batch's Nth
-command. Use a quoted heredoc (`<<'EOF'`) so the shell doesn't eat `\`
-continuations or `$N`. Notes live in `.git/.dm/pending` until `dm sync`
-folds them into the shared `refs/dm/store` branch (design.md §8);
-`worklist` and `gc` arrive with later milestones (plan.md M6+).
+retire whole paths; `vd:sha:landed:sha` / `vd:sha:unlanded` records where a
+rewritten line landed (design.md §9.4); `$N` references the entry created
+by the batch's Nth command. Use a quoted heredoc (`<<'EOF'`) so the shell
+doesn't eat `\` continuations or `$N`. Notes live in `.git/.dm/pending`
+until `dm sync` folds them into the shared `refs/dm/store` branch
+(design.md §8); `dm worklist` lists what wants judgment (orphans, disputed
+notes, abandoned lines grouped for one-`vd` repair — §9.6); `s`, stats,
+and `gc` arrive with later milestones (plan.md M7+).
 
 ## Develop
 

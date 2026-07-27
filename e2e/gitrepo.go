@@ -81,6 +81,16 @@ func (r *Repo) pinConfig() {
 // Git runs one git command in the repo and returns trimmed stdout.
 func (r *Repo) Git(args ...string) string {
 	r.t.Helper()
+	out, err := gitCommand(r, nil, args...).CombinedOutput()
+	if err != nil {
+		r.t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitCommand builds a git invocation with the repo's pinned timestamps
+// (§11.2) plus any extra environment.
+func gitCommand(r *Repo, extra []string, args ...string) *exec.Cmd {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = r.Dir
 	cmd.Env = append(os.Environ(),
@@ -88,11 +98,29 @@ func (r *Repo) Git(args ...string) string {
 		fmt.Sprintf("GIT_AUTHOR_DATE=%d +0000", 1600000000+r.commits),
 		fmt.Sprintf("GIT_COMMITTER_DATE=%d +0000", 1600000000+r.commits),
 	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		r.t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	cmd.Env = append(cmd.Env, extra...)
+	return cmd
+}
+
+// CloneRepoArgs is CloneRepo with extra clone flags, cloning over file://
+// so history-shaping flags (--depth, --single-branch) actually apply.
+func CloneRepoArgs(t *testing.T, remote string, n int, extra ...string) *Repo {
+	t.Helper()
+	r := &Repo{
+		t:         t,
+		Dir:       t.TempDir(),
+		ReplicaID: fmt.Sprintf("E2EREPL%d", n),
+		seedBase:  40000 + int64(n-1)*10000,
+		clockOff:  int64(n-1) * 500,
 	}
-	return strings.TrimSpace(string(out))
+	args := append([]string{"clone", "-q"}, extra...)
+	args = append(args, "file://"+remote, r.Dir)
+	cmd := exec.Command("git", args...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+	r.pinConfig()
+	return r
 }
 
 // WriteFile writes a working-tree file, creating parent dirs.

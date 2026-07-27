@@ -118,7 +118,9 @@ func parseCommand(logical, raw string, line int, creates []bool) (app.Command, *
 		return parseMove(rest, raw, line)
 	case "rm":
 		return parseRemove(rest, raw, line)
-	case "s", "vd":
+	case "vd":
+		return parseVerdict(rest, raw, line)
+	case "s":
 		return nil, &ParseError{line, fmt.Sprintf("command %q not implemented yet", name)}
 	default:
 		return nil, &ParseError{line, fmt.Sprintf("unknown command %q", name)}
@@ -327,6 +329,38 @@ func parseRemove(rest, raw string, line int) (app.Command, *ParseError) {
 		return nil, perr
 	}
 	return app.CmdRemove{RawText: raw, Path: path}, nil
+}
+
+// parseVerdict parses `vd:sha1:landed:sha2` | `vd:sha1:unlanded` (§4.2,
+// §9.4). SHAs are shape-checked here (lowercase hex); resolving them
+// against the repository is semantic and stays phase 2.
+func parseVerdict(rest, raw string, line int) (app.Command, *ParseError) {
+	f := strings.Split(rest, ":")
+	if len(f) < 2 || len(f) > 3 {
+		return nil, &ParseError{line, "expected vd:sha1:landed:sha2 or vd:sha1:unlanded"}
+	}
+	subject := record.SHA(f[0])
+	if !subject.Valid() {
+		return nil, &ParseError{line, fmt.Sprintf("expected a commit sha, got %q", f[0])}
+	}
+	switch f[1] {
+	case "unlanded":
+		if len(f) != 2 {
+			return nil, &ParseError{line, "vd:sha1:unlanded takes no further fields"}
+		}
+		return app.CmdVerdict{RawText: raw, Subject: subject}, nil
+	case "landed":
+		if len(f) != 3 {
+			return nil, &ParseError{line, "expected vd:sha1:landed:sha2"}
+		}
+		landedAs := record.SHA(f[2])
+		if !landedAs.Valid() {
+			return nil, &ParseError{line, fmt.Sprintf("expected a commit sha, got %q", f[2])}
+		}
+		return app.CmdVerdict{RawText: raw, Subject: subject, Landed: true, LandedAs: landedAs}, nil
+	default:
+		return nil, &ParseError{line, "expected landed or unlanded after the sha"}
+	}
 }
 
 // isRefField reports a handle-shaped field (`#…` or `$…`).

@@ -20,6 +20,14 @@ type Set[T comparable] map[T]struct{}
 // Ref names a local or remote ref (the worklist's branch hint).
 type Ref string
 
+// RefTip is one ref an origin is reachable from, with its tip — the tip is
+// what the mint pass attempts to land (§9.4 fold step 3) and what the
+// worklist's line grouping keys on (§9.6).
+type RefTip struct {
+	Ref Ref
+	Tip record.SHA
+}
+
 // TreeFP is a folder fingerprint: the tree object at a path plus its member
 // files, taken from a commit's tree (design.md §9.3).
 type TreeFP struct {
@@ -45,13 +53,6 @@ type ReflogEntry struct {
 	Action string
 }
 
-// Commit is one commit of an enumerated segment, with the empty-diff mark
-// the m2 matcher consumes.
-type Commit struct {
-	SHA       record.SHA
-	EmptyDiff bool
-}
-
 // PatchID is a canonical per-commit patch id (pinned diff flags).
 type PatchID string
 
@@ -69,9 +70,10 @@ type Lineage interface {
 	// step 1, batched: one rev-list walk classifies all origins.
 	LandedInHead(origins []record.SHA) (Set[record.SHA], error)
 	// ReachableFrom reports, per origin, the refs it is reachable from —
-	// rule (b) step 3, batched. The decorator applies the ff-aware
-	// unreachability cache (§8.2).
-	ReachableFrom(origins []record.SHA) (map[record.SHA][]Ref, error)
+	// rule (b) step 3, batched. An origin whose objects are not locally
+	// available is unreachable by definition. The decorator applies the
+	// ff-aware unreachability cache (§8.2).
+	ReachableFrom(origins []record.SHA) (map[record.SHA][]RefTip, error)
 	// IsAncestor reports whether a is an ancestor of b — worklist
 	// line-grouping among a small set of dead origins (§9.6).
 	IsAncestor(a, b record.SHA) (bool, error)
@@ -106,12 +108,15 @@ type Match interface {
 	// Score scores blob directly against candidate paths (dirty working
 	// tree case).
 	Score(blob record.SHA, candidates []record.Path) (map[record.Path]int, error)
-	// ReflogEntries returns raw reflog lines; core filters actions (m1).
+	// ReflogEntries returns raw reflog lines, oldest first per ref; core
+	// filters actions (m1).
 	ReflogEntries() ([]ReflogEntry, error)
 	// MergeBase returns the merge base of a and b; nil means none.
 	MergeBase(a, b record.SHA) (*record.SHA, error)
-	// Segment enumerates (base..tip] in order, empty-diff marked (m2).
-	Segment(base, tip record.SHA) ([]Commit, error)
+	// Segment enumerates (base..tip] oldest-first ("" base = the whole
+	// line). Empty-diff commits are detected by PatchID returning nil —
+	// the m2 skip rule.
+	Segment(base, tip record.SHA) ([]record.SHA, error)
 	// PatchID computes the canonical patch id of commit; nil means the
 	// commit has an empty diff.
 	PatchID(commit record.SHA) (*PatchID, error)
