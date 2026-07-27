@@ -111,6 +111,46 @@ func (s *Store) Read(tip *record.SHA) (union.Set, error) {
 // commit is *base itself* — the caller detects nothing-to-push by
 // comparing.
 func (s *Store) Commit(set union.Set, base *record.SHA, baseSet union.Set, blobSrc func(record.SHA) ([]byte, bool), when time.Time) (record.SHA, error) {
+	return s.commit(set, base, baseSet, blobSrc, "dm sync", when)
+}
+
+// Compact builds the §8.7 orphan re-commit: the swept set as a full tree
+// built from scratch, no parents — the store's history carries no
+// information, only the tip tree is data. The build is canonical (git
+// trees are content-addressed), so two concurrent compactors over the same
+// tip produce the same tree SHA and the gc race is benign.
+func (s *Store) Compact(set union.Set, blobSrc func(record.SHA) ([]byte, bool), when time.Time) (record.SHA, error) {
+	return s.commit(set, nil, union.NewSet(), blobSrc, "dm gc", when)
+}
+
+// TipBlobSource returns a blobSrc reading anchored-blob content out of a
+// tip's own blobs/ tree. The path carries the anchor (§8.1), so the lookup
+// holds even where filters made the git object name differ from the anchor
+// SHA — which is why gc sources the surviving blobs here, not from the
+// object database by anchor.
+func (s *Store) TipBlobSource(tip record.SHA) (func(record.SHA) ([]byte, bool), error) {
+	entries, err := s.Repo.LsTree(tip)
+	if err != nil {
+		return nil, err
+	}
+	objects := map[record.SHA]record.SHA{}
+	for _, e := range entries {
+		parts := strings.Split(e.Path, "/")
+		if len(parts) == 3 && parts[0] == "blobs" {
+			objects[record.SHA(parts[1]+parts[2])] = e.SHA
+		}
+	}
+	return func(anchor record.SHA) ([]byte, bool) {
+		obj, ok := objects[anchor]
+		if !ok {
+			return nil, false
+		}
+		content, err := s.Repo.CatBlob(obj)
+		return content, err == nil
+	}, nil
+}
+
+func (s *Store) commit(set union.Set, base *record.SHA, baseSet union.Set, blobSrc func(record.SHA) ([]byte, bool), msg string, when time.Time) (record.SHA, error) {
 	var add []gitio.TreeEntry
 	for id, data := range set.Records {
 		if _, ok := baseSet.Records[id]; ok {
@@ -181,7 +221,7 @@ func (s *Store) Commit(set union.Set, base *record.SHA, baseSet union.Set, blobS
 	if err != nil {
 		return "", err
 	}
-	return s.Repo.CommitTree(tree, parents, "dm sync", when)
+	return s.Repo.CommitTree(tree, parents, msg, when)
 }
 
 // recordPath shards by the rec-id's leading time chars so tree objects

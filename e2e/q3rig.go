@@ -5,10 +5,28 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
 )
+
+// vdFacts extracts `VD … <origin> landed <landed-as> <matcher>` /
+// `VD … <origin> unlanded` facts from a dump, as "origin→landed-as:matcher"
+// or "origin→unlanded" strings.
+var vdRe = regexp.MustCompile(`(?m)^VD \S+ (\S+) (?:landed (\S+) (\S+)|(unlanded))$`)
+
+func vdFacts(dump string) []string {
+	var out []string
+	for _, m := range vdRe.FindAllStringSubmatch(dump, -1) {
+		if m[4] == "unlanded" {
+			out = append(out, m[1]+"→unlanded")
+		} else {
+			out = append(out, m[1]+"→"+m[2]+":"+m[3])
+		}
+	}
+	return out
+}
 
 // The Q3 rig (design.md §14, §11.4): landing-detection precision and
 // recall. It generates a squash- and force-push-heavy history with *known

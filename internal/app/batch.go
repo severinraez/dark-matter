@@ -172,21 +172,21 @@ func (s *Session) newExecutorFrom(view []record.Record) (*executor, error) {
 }
 
 // absorb indexes one record into the batch-scoped view and invalidates the
-// memos it touches. Handles derive from CR admission only.
+// memos it touches. Entries are admitted — ordered, handle derived — by
+// their first body-bearing record: normally the CR, or the surviving
+// newest SU after a shadow sweep dropped an aged CR (§8.7). The handle is
+// a pure function of the entry-id, so it is stable across that transition.
 func (ex *executor) absorb(rec record.Record) error {
 	switch v := rec.(type) {
 	case record.Create:
-		if _, seen := ex.handles[v.Entry]; !seen {
-			ex.order = append(ex.order, v.Entry)
-			h, err := record.DeriveHandle(v.Entry, func(h record.Handle) bool { return ex.taken[h] })
-			if err != nil {
-				return err
-			}
-			ex.handles[v.Entry] = h
-			ex.taken[h] = true
+		if err := ex.admit(v.Entry); err != nil {
+			return err
 		}
 		ex.addEntryRecord(v.Entry, rec)
 	case record.Supersede:
+		if err := ex.admit(v.Entry); err != nil {
+			return err
+		}
 		ex.addEntryRecord(v.Entry, rec)
 	case record.Tombstone:
 		ex.addEntryRecord(v.Entry, rec)
@@ -208,6 +208,22 @@ func (ex *executor) absorb(rec record.Record) error {
 		ex.folded = make(map[record.EntryID]fold.Entry)
 		ex.resolved = make(map[record.EntryID]resolve.Resolution)
 	}
+	return nil
+}
+
+// admit registers an entry on first sight, replaying handle extension in
+// rec-id order exactly as it resolved at each mint (§3.5).
+func (ex *executor) admit(id record.EntryID) error {
+	if _, seen := ex.handles[id]; seen {
+		return nil
+	}
+	ex.order = append(ex.order, id)
+	h, err := record.DeriveHandle(id, func(h record.Handle) bool { return ex.taken[h] })
+	if err != nil {
+		return err
+	}
+	ex.handles[id] = h
+	ex.taken[h] = true
 	return nil
 }
 

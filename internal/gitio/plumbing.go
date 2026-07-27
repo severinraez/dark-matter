@@ -299,6 +299,30 @@ func (r *Repo) Push(remote string, src record.SHA, dst string) error {
 	return err
 }
 
+// PushLease updates dst on the remote to src iff the remote still holds
+// expect — gc's compare-and-swap (§8.7): always --force-with-lease with an
+// explicit expected value, never plain --force, so a sync landing in the
+// fetch→sweep→push window can never be overwritten. A lease rejection
+// returns ErrPushRejected (wrapped), re-entering the caller's retry loop.
+func (r *Repo) PushLease(remote string, src record.SHA, dst string, expect record.SHA) error {
+	out, err := r.gitRaw(nil, nil, "push", "--porcelain",
+		"--force-with-lease="+dst+":"+string(expect), remote, string(src)+":"+dst)
+	if err == nil {
+		return nil
+	}
+	// Porcelain per-ref status: `!<TAB>src:dst<TAB>[rejected] (reason)`.
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(line, "!") {
+			continue
+		}
+		if strings.Contains(line, "stale info") ||
+			strings.Contains(line, "non-fast-forward") || strings.Contains(line, "fetch first") {
+			return fmt.Errorf("%w: %s", ErrPushRejected, strings.TrimSpace(line))
+		}
+	}
+	return err
+}
+
 // gitRaw runs git with optional stdin bytes and extra env, returning raw
 // stdout (git's own exec plumbing keeps trimmed-string semantics).
 func (r *Repo) gitRaw(stdin []byte, env []string, args ...string) ([]byte, error) {

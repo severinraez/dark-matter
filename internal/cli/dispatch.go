@@ -68,8 +68,10 @@ func Dispatch(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return nil
 		})
 	case "gc":
-		fmt.Fprintf(stderr, "dm %s: not implemented yet\n", args[0])
-		return 1
+		return run(stderr, func(det app.Determinism) error {
+			opts := app.GCOptions{SkipFetch: os.Getenv(app.EnvSkipFetch) != ""}
+			return app.GC(".", det, opts, stdout, stderr)
+		})
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 		return 0

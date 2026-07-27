@@ -2,7 +2,6 @@ package e2e
 
 import (
 	"fmt"
-	"regexp"
 	"strings"
 	"testing"
 )
@@ -56,23 +55,6 @@ func newLandingRepo(t *testing.T) *landingRepo {
 	a.Git("push", "-q", "origin", "main")
 	a.Git("checkout", "-q", "feature")
 	return l
-}
-
-// vdLines extracts `VD … <origin> landed <landed-as> <matcher>` /
-// `VD … <origin> unlanded` facts from a dump, as "origin→landed-as:matcher"
-// or "origin→unlanded" strings.
-var vdRe = regexp.MustCompile(`(?m)^VD \S+ (\S+) (?:landed (\S+) (\S+)|(unlanded))$`)
-
-func vdFacts(dump string) []string {
-	var out []string
-	for _, m := range vdRe.FindAllStringSubmatch(dump, -1) {
-		if m[4] == "unlanded" {
-			out = append(out, m[1]+"→unlanded")
-		} else {
-			out = append(out, m[1]+"→"+m[2]+":"+m[3])
-		}
-	}
-	return out
 }
 
 func hasVD(dump, origin, landedAs, matcher string) bool {

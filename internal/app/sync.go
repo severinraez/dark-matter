@@ -13,10 +13,11 @@ import (
 	"meltcloud.io/dm/internal/store"
 )
 
-// EnvSkipFetch skips sync's initial fetch when set (non-empty). Debug/test
-// residue in the §11.2 spirit: it lets the harness stage a genuinely stale
-// mirror and drive the non-fast-forward retry path deterministically (the
-// retry loop's own fetches always run — convergence is unaffected).
+// EnvSkipFetch skips sync's and gc's initial fetch when set (non-empty).
+// Debug/test residue in the §11.2 spirit: it lets the harness stage a
+// genuinely stale mirror and drive the non-fast-forward / lost-lease retry
+// paths deterministically (the retry loops' own fetches always run —
+// convergence is unaffected).
 const EnvSkipFetch = "DM_SKIP_FETCH"
 
 // SyncOptions carries sync's invocation knobs (cli resolves them from the
