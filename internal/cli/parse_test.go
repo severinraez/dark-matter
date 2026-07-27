@@ -55,6 +55,24 @@ func TestParseBatch(t *testing.T) {
 			},
 		},
 		{
+			name:  "search with AND binding tighter than OR",
+			input: "s:db/schema.rb:tenant+scope|isolation\n",
+			want: []app.Command{app.CmdSearch{
+				RawText: "s:db/schema.rb:tenant+scope|isolation",
+				Path:    "db/schema.rb",
+				Terms:   [][]string{{"tenant", "scope"}, {"isolation"}},
+			}},
+		},
+		{
+			name:  "search terms are never percent-decoded",
+			input: "s:x.rb:50%off\n",
+			want: []app.Command{app.CmdSearch{
+				RawText: "s:x.rb:50%off",
+				Path:    "x.rb",
+				Terms:   [][]string{{"50%off"}},
+			}},
+		},
+		{
 			name:  "percent-decoded path",
 			input: "r:foo%3A1\n",
 			want:  []app.Command{app.CmdRead{RawText: "r:foo%3A1", Path: "foo:1"}},
@@ -161,7 +179,9 @@ func TestParseBatchRejects(t *testing.T) {
 		{"bad subject", "r:ok\na:foo:x:body\n", 2, "expected subject (c|a|d|o) after path"},
 		{"empty body", "a:foo:c:\n", 1, "empty body"},
 		{"unknown command", "q:foo\n", 1, `unknown command "q"`},
-		{"not yet implemented verb", "s:foo:term\n", 1, `command "s" not implemented yet`},
+		{"search missing terms", "s:foo\n", 1, "expected s:path:t1|t2"},
+		{"search empty term", "s:foo:a||b\n", 1, "empty search term"},
+		{"search empty and-term", "s:foo:a+\n", 1, "empty search term"},
 		{"bare percent gets the hint", "r:50%off\n", 1, `write %25`},
 		{"non-numeric depth", "r:foo:bar\n", 1, "expected numeric depth"},
 		{"too many read fields", "r:a:b:c\n", 1, "expected r:path or r:path:depth"},

@@ -31,6 +31,7 @@ func At(gitDir string) *Dir {
 func (d *Dir) replicaPath() string       { return filepath.Join(d.Root, "replica") }
 func (d *Dir) pendingRecordsDir() string { return filepath.Join(d.Root, "pending", "records") }
 func (d *Dir) pendingBlobsDir() string   { return filepath.Join(d.Root, "pending", "blobs") }
+func (d *Dir) pendingStatsPath() string  { return filepath.Join(d.Root, "pending", "stats") }
 func (d *Dir) cacheDir() string          { return filepath.Join(d.Root, "cache") }
 func (d *Dir) lockPath() string          { return filepath.Join(d.Root, "lock") }
 
@@ -156,6 +157,46 @@ func (d *Dir) ClearPending(records []record.RecID, blobs []record.SHA) error {
 		}
 	}
 	return nil
+}
+
+// ReadPendingStats returns the raw stat-delta accumulator
+// (pending/stats, §8.1); a missing file is the empty accumulator.
+func (d *Dir) ReadPendingStats() ([]byte, error) {
+	data, err := os.ReadFile(d.pendingStatsPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	return data, err
+}
+
+// WritePendingStats replaces the stat-delta accumulator atomically — one
+// write per invocation, under the invocation lock (§8.1 cadence,
+// architecture.md §7: flush at Close).
+func (d *Dir) WritePendingStats(content []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(d.pendingStatsPath()), "tmp-*")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(content); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), d.pendingStatsPath())
+}
+
+// ClearPendingStats removes the accumulator — called only after the push
+// that folded it into the store landed (§8.4).
+func (d *Dir) ClearPendingStats() error {
+	err := os.Remove(d.pendingStatsPath())
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // StageBlob stages anchored content the odb lacks under pending/blobs/<sha>

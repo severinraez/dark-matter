@@ -74,9 +74,10 @@ func Merge(a, b Set) Set {
 }
 
 // WithOwn returns s plus this replica's not-yet-pushed contribution:
-// pending records and staged blobs (§8.4's "re-contributes only its own").
-// Pending stat deltas join in M7.
-func WithOwn(s Set, records map[record.RecID][]byte, blobs []record.SHA) Set {
+// pending records, staged blobs, and the pending stat deltas folded into
+// this replica's own register file — add counters, max `t` (§8.4's
+// "re-contributes only its own"; §8.1's sync cadence).
+func WithOwn(s Set, records map[record.RecID][]byte, blobs []record.SHA, replica string, deltas Stats) Set {
 	out := clone(s)
 	for id, data := range records {
 		if _, ok := out.Records[id]; !ok {
@@ -85,6 +86,24 @@ func WithOwn(s Set, records map[record.RecID][]byte, blobs []record.SHA) Set {
 	}
 	for _, sha := range blobs {
 		out.Blobs[sha] = true
+	}
+	if len(deltas) > 0 {
+		out.Stats[replica] = AddStats(out.Stats[replica], deltas)
+	}
+	return out
+}
+
+// AddStats folds a delta accumulator into a register file: counters sum,
+// `t` takes the max (§8.1 — deltas are increments, unlike the same-file
+// snapshot reconciliation in Merge, which is field-wise max).
+func AddStats(base, deltas Stats) Stats {
+	out := make(Stats, len(base)+len(deltas))
+	for id, row := range base {
+		out[id] = row
+	}
+	for id, d := range deltas {
+		r := out[id]
+		out[id] = Row{I: r.I + d.I, X: r.X + d.X, H: r.H + d.H, T: max(r.T, d.T)}
 	}
 	return out
 }

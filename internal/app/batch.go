@@ -27,6 +27,7 @@ type Block struct {
 	Macro     []MacroItem
 	Surface   *view.Surface
 	Expansion *view.Expansion
+	Search    *view.SearchResult
 }
 
 // MacroItem is one entry's line inside an mv/rm expansion: an ack, or a
@@ -73,6 +74,8 @@ func (s *Session) ExecuteBatch(cmds []Command) (BatchResult, error) {
 			} else {
 				b.Surface, b.Err = ex.read(c)
 			}
+		case CmdSearch:
+			b.Search, b.Err = ex.search(c)
 		case CmdSupersede:
 			b.Ack, b.Err = ex.supersede(c)
 		case CmdTombstone:
@@ -588,7 +591,51 @@ func (ex *executor) create(idx int, c CmdCreate) (*view.Created, string) {
 		return nil, err.Error()
 	}
 	ex.made[idx] = entryID
-	return &view.Created{Handle: handle}, ""
+	created := &view.Created{Handle: handle}
+	// Crowding nudge (§9.6 layer 2): an `a` landing on a node already
+	// carrying many visible notes appends the fold hint to its ack —
+	// caught at write time, when the writer has just read the surface.
+	n, err := ex.visibleAt(c.Path)
+	if err != nil {
+		return nil, err.Error()
+	}
+	if n >= view.CrowdingThreshold {
+		created.Crowded = n
+	}
+	return created, ""
+}
+
+// visibleAt counts the visible notes homed at a node — the crowding
+// signal's input.
+func (ex *executor) visibleAt(path record.Path) (int, error) {
+	n := 0
+	for _, id := range ex.order {
+		e, err := ex.fold(id)
+		if err != nil {
+			return 0, err
+		}
+		if e.Deleted || !e.Landed {
+			continue
+		}
+		res, err := ex.resolution(id)
+		if err != nil {
+			return 0, err
+		}
+		if !res.State.Visible() {
+			continue
+		}
+		if e.Anchor.IsPath() {
+			for _, home := range folderHomes(res) {
+				if home == path {
+					n++
+					break
+				}
+			}
+		} else if res.Path == path {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // restampPath picks the home a confirming write (`u`, plain `k`)
@@ -1019,15 +1066,19 @@ func (ex *executor) destinationExists(path record.Path) (bool, string, error) {
 
 // ---- reads ----
 
-// read executes `r:path` (§5.1, §8.6): own entries are the notes that
-// resolve to this node (rule (a) layers 1–4, §9.1–§9.3), flagged per
+// read executes `r:path` (§5.1, §5.4, §8.6): own entries are the notes
+// that resolve to this node (rule (a) layers 1–4, §9.1–§9.3), flagged per
 // resolution + dispute; parent folder notes cover the node recursively
-// (§3.2), split candidates included flagged (§9.3). Within each list,
-// flagged entries sink below unflagged ones (§5.6's flag demotion; the
-// full ranking arrives with M7).
+// (§3.2), split candidates included flagged (§9.3); the link dimension
+// shows handles + labels; folder reads add the child inventory. Lists rank
+// per §5.6; a depth modifier inlines parent then link bodies within the
+// token budget. Every entry shown bumps its impression counter (§7.1).
 func (ex *executor) read(c CmdRead) (*view.Surface, string) {
-	surface := &view.Surface{Node: c.Path}
+	surface := &view.Surface{Node: c.Path, Depth: c.Depth}
 	shown := make(map[record.EntryID]bool)
+	var ownIDs []record.EntryID
+	children := make(map[record.Path][]int) // child → counts in view.SubjectOrder
+	bodyLines := func(body string) int { return strings.Count(body, "\n") + 1 }
 	for _, id := range ex.order {
 		e, err := ex.fold(id)
 		if err != nil {
@@ -1045,38 +1096,186 @@ func (ex *executor) read(c CmdRead) (*view.Surface, string) {
 		}
 		flags := view.Flags(res.State, e.Disputed)
 		if !e.Anchor.IsPath() {
-			// File note: own iff it resolves to this exact node.
+			// File note: own iff it resolves to this exact node; part of
+			// the child inventory when the read folder contains it (§5.4).
 			if res.Path == c.Path {
 				surface.Own = append(surface.Own, view.Preview(e.Subj, ex.handles[id], e.Body, flags))
+				ownIDs = append(ownIDs, id)
 				shown[id] = true
+			} else if c.Path.IsFolder() && res.Path.Under(c.Path) {
+				addChild(children, childOf(c.Path, res.Path), e.Subj)
+				surface.Hidden += bodyLines(e.Body)
 			}
 			continue
 		}
 		// Folder note: own at its home node, parent for everything under
-		// its home; a split covers reads under every candidate (§9.3).
+		// its home, child inventory below the read folder; a split covers
+		// reads under every candidate (§9.3).
 		for _, home := range folderHomes(res) {
 			if home == c.Path {
 				surface.Own = append(surface.Own, view.Preview(e.Subj, ex.handles[id], e.Body, flags))
+				ownIDs = append(ownIDs, id)
 				shown[id] = true
 				break
 			}
 			if c.Path.Under(home) {
 				surface.Parents = append(surface.Parents, view.ParentPreview{
 					Subj: e.Subj, Handle: ex.handles[id], Path: home, Flags: flags,
+					Body: e.Body, Lines: bodyLines(e.Body),
 				})
 				shown[id] = true
 				break
 			}
+			if c.Path.IsFolder() && home != c.Path && home.Under(c.Path) {
+				addChild(children, childOf(c.Path, home), e.Subj)
+				surface.Hidden += bodyLines(e.Body)
+				break
+			}
 		}
 	}
-	demoteFlagged(surface.Own, func(p view.EntryPreview) bool { return len(p.Flags) > 0 })
-	sortParents(surface.Parents)
-	links, err := ex.countLinks(shown)
+	view.RankOwn(surface.Own)
+	view.RankParents(surface.Parents)
+	surface.Children = childLines(children)
+	linkItems, err := ex.linkItems(ownIDs, shown)
 	if err != nil {
 		return nil, err.Error()
 	}
-	surface.Links = links
+	surface.Links = linkItems
+	edges, err := ex.countLinks(shown)
+	if err != nil {
+		return nil, err.Error()
+	}
+	surface.LinkEdges = edges
+
+	// Depth modifier (§5.4): inline parent bodies at depth ≥ 1, link
+	// bodies at depth ≥ 2, degrading to collapsed once the budget is
+	// spent. Hidden tallies what stayed collapsed (§5.2).
+	budget := view.DepthBudgetLines
+	for i := range surface.Parents {
+		p := &surface.Parents[i]
+		if c.Depth >= 1 && p.Lines <= budget {
+			budget -= p.Lines
+		} else {
+			surface.Hidden += p.Lines
+			p.Body = ""
+		}
+	}
+	for i := range surface.Links {
+		ln := &surface.Links[i]
+		if c.Depth >= 2 && ln.Lines <= budget {
+			budget -= ln.Lines
+		} else {
+			surface.Hidden += ln.Lines
+			ln.Body = ""
+		}
+	}
+	for _, p := range surface.Own {
+		surface.Hidden += p.MoreLines
+	}
+	for id := range shown {
+		ex.s.BumpImpression(id)
+	}
 	return surface, ""
+}
+
+// childOf maps a path under the read folder to its immediate child: the
+// path itself when directly under, the first subfolder otherwise (§5.4's
+// child inventory navigates down one level).
+func childOf(folder, p record.Path) record.Path {
+	rel := string(p)
+	if folder != record.RootFolder {
+		rel = strings.TrimPrefix(rel, string(folder))
+	}
+	if idx := strings.Index(rel, "/"); idx >= 0 && idx < len(rel)-1 {
+		rel = rel[:idx+1]
+	}
+	if folder == record.RootFolder {
+		return record.Path(rel)
+	}
+	return folder + record.Path(rel)
+}
+
+func addChild(children map[record.Path][]int, child record.Path, subj record.Subject) {
+	counts := children[child]
+	if counts == nil {
+		counts = make([]int, len(view.SubjectOrder))
+	}
+	for i, s := range view.SubjectOrder {
+		if s == subj {
+			counts[i]++
+		}
+	}
+	children[child] = counts
+}
+
+func childLines(children map[record.Path][]int) []view.ChildLine {
+	paths := make([]record.Path, 0, len(children))
+	for p := range children {
+		paths = append(paths, p)
+	}
+	sort.Slice(paths, func(i, j int) bool { return paths[i] < paths[j] })
+	var out []view.ChildLine
+	for _, p := range paths {
+		line := view.ChildLine{Path: p}
+		for i, n := range children[p] {
+			if n > 0 {
+				line.Counts = append(line.Counts, view.SubjectCount{Subj: view.SubjectOrder[i], N: n})
+			}
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// linkItems assembles the surface's link dimension (§5.1): the far
+// endpoint of every live edge touching an own entry, deduped, labeled by
+// the link comment or the far entry's first body line.
+func (ex *executor) linkItems(ownIDs []record.EntryID, shown map[record.EntryID]bool) ([]view.LinkItem, error) {
+	own := make(map[record.EntryID]bool, len(ownIDs))
+	for _, id := range ownIDs {
+		own[id] = true
+	}
+	var items []view.LinkItem
+	seen := make(map[record.EntryID]bool)
+	for _, ln := range ex.linkSet() {
+		var far record.EntryID
+		switch {
+		case own[ln.From]:
+			far = ln.To
+		case own[ln.To]:
+			far = ln.From
+		default:
+			continue
+		}
+		if seen[far] || own[far] {
+			continue
+		}
+		ok, err := ex.live(far)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		seen[far] = true
+		shown[far] = true
+		e, err := ex.fold(far)
+		if err != nil {
+			return nil, err
+		}
+		label := ln.Comment
+		if label == "" {
+			label, _, _ = strings.Cut(e.Body, "\n")
+		}
+		items = append(items, view.LinkItem{
+			Handle: ex.handles[far],
+			Subj:   e.Subj,
+			Label:  label,
+			Body:   e.Body,
+			Lines:  strings.Count(e.Body, "\n") + 1,
+		})
+	}
+	return items, nil
 }
 
 // folderHomes lists where a folder note currently applies: its resolved
@@ -1094,31 +1293,6 @@ func folderHomes(res resolve.Resolution) []record.Path {
 		return []record.Path{res.Path}
 	}
 	return nil
-}
-
-// demoteFlagged stably sinks flagged previews below unflagged ones (§5.6).
-func demoteFlagged[T any](items []T, flagged func(T) bool) {
-	sort.SliceStable(items, func(i, j int) bool {
-		return !flagged(items[i]) && flagged(items[j])
-	})
-}
-
-// sortParents orders parent notes by proximity — closer ancestors first
-// (§5.6) — with flagged ones sinking within the same proximity.
-func sortParents(parents []view.ParentPreview) {
-	depth := func(p record.Path) int {
-		if p == record.RootFolder {
-			return 0 // the root is every node's furthest ancestor
-		}
-		return strings.Count(string(p), "/")
-	}
-	sort.SliceStable(parents, func(i, j int) bool {
-		di, dj := depth(parents[i].Path), depth(parents[j].Path)
-		if di != dj {
-			return di > dj
-		}
-		return len(parents[i].Flags) == 0 && len(parents[j].Flags) > 0
-	})
 }
 
 // countLinks tallies live link edges touching the surfaced entries — the
@@ -1173,6 +1347,8 @@ func (ex *executor) expand(c CmdRead) (*view.Expansion, string) {
 		Flags:  view.Flags(res.State, e.Disputed),
 		Body:   e.Body,
 	}
+	// The real click (§7.1): count the expansion, refresh last-expanded.
+	ex.s.BumpExpansion(id)
 	if res.State != resolve.Fresh {
 		exp.Vote = res.Vote // judgment evidence rides the drill (§9.3)
 	}
@@ -1206,4 +1382,117 @@ func (ex *executor) expand(c CmdRead) (*view.Expansion, string) {
 		}
 	}
 	return exp, ""
+}
+
+// search executes `s:path:terms` (§5.5): grep the node's entire
+// read-context — own notes, all parent folder notes, linked entries one
+// level out — returning matches as handles + snippets. Matches bump the
+// search-hit counter, a distinct signal from impressions (§7.1).
+func (ex *executor) search(c CmdSearch) (*view.SearchResult, string) {
+	context, err := ex.contextEntries(c.Path)
+	if err != nil {
+		return nil, err.Error()
+	}
+	result := &view.SearchResult{Node: c.Path, Searched: len(context)}
+	for _, id := range context {
+		e, err := ex.fold(id)
+		if err != nil {
+			return nil, err.Error()
+		}
+		res, err := ex.resolution(id)
+		if err != nil {
+			return nil, err.Error()
+		}
+		snippet, more, ok := view.MatchTerms(e.Body, c.Terms)
+		if !ok {
+			continue
+		}
+		home := e.Path
+		if res.Path != "" {
+			home = res.Path
+		}
+		result.Matches = append(result.Matches, view.SearchMatch{
+			Handle:  ex.handles[id],
+			Subj:    e.Subj,
+			Path:    home,
+			Snippet: snippet,
+			More:    more,
+		})
+		ex.s.BumpSearchHit(id)
+	}
+	return result, ""
+}
+
+// contextEntries assembles a node's read-context in disclosure order: own
+// entries, covering parent folder notes, then entries linked to any of
+// those, one level, deduped — the set `s` greps instead of the agent
+// expanding every parent (§5.5).
+func (ex *executor) contextEntries(path record.Path) ([]record.EntryID, error) {
+	var context []record.EntryID
+	in := make(map[record.EntryID]bool)
+	add := func(id record.EntryID) {
+		if !in[id] {
+			in[id] = true
+			context = append(context, id)
+		}
+	}
+	var parents []record.EntryID
+	for _, id := range ex.order {
+		e, err := ex.fold(id)
+		if err != nil {
+			return nil, err
+		}
+		if e.Deleted || !e.Landed {
+			continue
+		}
+		res, err := ex.resolution(id)
+		if err != nil {
+			return nil, err
+		}
+		if !res.State.Visible() {
+			continue
+		}
+		if !e.Anchor.IsPath() {
+			if res.Path == path {
+				add(id)
+			}
+			continue
+		}
+		for _, home := range folderHomes(res) {
+			if home == path {
+				add(id)
+				break
+			}
+			if path.Under(home) {
+				parents = append(parents, id)
+				break
+			}
+		}
+	}
+	for _, id := range parents {
+		add(id)
+	}
+	// Linked one level out from the context so far, live endpoints only.
+	direct := append([]record.EntryID(nil), context...)
+	for _, seed := range direct {
+		for _, ln := range ex.linkSet() {
+			var far record.EntryID
+			switch seed {
+			case ln.From:
+				far = ln.To
+			case ln.To:
+				far = ln.From
+			default:
+				continue
+			}
+			ok, err := ex.live(far)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				add(far)
+			}
+		}
+	}
+	return context, nil
 }

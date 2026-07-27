@@ -31,7 +31,13 @@ func renderBatch(w io.Writer, res app.BatchResult) {
 		case b.Err != "":
 			fmt.Fprintf(w, "%s %s\n", glyphErr, b.Err)
 		case b.Created != nil:
-			fmt.Fprintf(w, "+ #%s created\n", b.Created.Handle)
+			fmt.Fprintf(w, "+ #%s created", b.Created.Handle)
+			if b.Created.Crowded > 0 {
+				// The crowding nudge (§9.6 layer 2) — still one line,
+				// never an error (§4.3).
+				fmt.Fprintf(w, " · node has %d notes, consider folding with u", b.Created.Crowded)
+			}
+			fmt.Fprintln(w)
 		case b.Ack != nil:
 			renderAck(w, *b.Ack)
 		case b.Macro != nil:
@@ -46,6 +52,8 @@ func renderBatch(w io.Writer, res app.BatchResult) {
 			renderSurface(w, b.Surface)
 		case b.Expansion != nil:
 			renderExpansion(w, b.Expansion)
+		case b.Search != nil:
+			renderSearch(w, b.Search)
 		}
 	}
 	if res.Failed > 0 {
@@ -87,9 +95,11 @@ func flagSuffix(flags []view.Flag) string {
 	return b.String()
 }
 
-// renderSurface writes own-entry previews, the collapsed parent line, and
-// the inventory footer (§5.1): every collapsed item carries its size, and
-// the context line is the "how much more is there" signal.
+// renderSurface writes own-entry previews, the parent dimension (collapsed
+// at depth 0, inlined within budget at depth ≥ 1 — §5.4), the link labels,
+// the child inventory (folder reads), and the inventory footer (§5.1):
+// every collapsed item carries its size, and the context line is the "how
+// much more is there" signal.
 func renderSurface(w io.Writer, s *view.Surface) {
 	for _, p := range s.Own {
 		fmt.Fprintf(w, "%s #%s %s", p.Subj, p.Handle, p.FirstLine)
@@ -99,7 +109,19 @@ func renderSurface(w io.Writer, s *view.Surface) {
 		fmt.Fprint(w, flagSuffix(p.Flags))
 		fmt.Fprintln(w)
 	}
-	if len(s.Parents) > 0 {
+	if s.Depth >= 1 {
+		for _, p := range s.Parents {
+			fmt.Fprintf(w, "↑ %s #%s %s", p.Subj, p.Handle, record.EncodePath(p.Path))
+			if p.Body == "" {
+				fmt.Fprintf(w, " (+%d lines)", p.Lines)
+			}
+			fmt.Fprint(w, flagSuffix(p.Flags))
+			fmt.Fprintln(w)
+			if p.Body != "" {
+				fmt.Fprintln(w, p.Body)
+			}
+		}
+	} else if len(s.Parents) > 0 {
 		notes, arch := "notes", 0
 		var called []string
 		for _, p := range s.Parents {
@@ -117,15 +139,53 @@ func renderSurface(w io.Writer, s *view.Surface) {
 		}
 		fmt.Fprintln(w)
 	}
+	var collapsed []string
+	for _, ln := range s.Links {
+		if ln.Body != "" {
+			fmt.Fprintf(w, "→ #%s %s\n%s\n", ln.Handle, ln.Label, ln.Body)
+		} else {
+			collapsed = append(collapsed, fmt.Sprintf("#%s %s", ln.Handle, ln.Label))
+		}
+	}
+	if len(collapsed) > 0 {
+		fmt.Fprintf(w, "→ %s\n", strings.Join(collapsed, " · "))
+	}
+	for _, c := range s.Children {
+		parts := make([]string, len(c.Counts))
+		for i, sc := range c.Counts {
+			parts[i] = fmt.Sprintf("%d%s", sc.N, sc.Subj)
+		}
+		fmt.Fprintf(w, "↓ %s %s\n", record.EncodePath(c.Path), strings.Join(parts, " "))
+	}
 	links := "links"
-	if s.Links == 1 {
+	if s.LinkEdges == 1 {
 		links = "link"
 	}
-	fmt.Fprintf(w, "context: %d own · %d parent · %d %s", len(s.Own), len(s.Parents), s.Links, links)
+	fmt.Fprintf(w, "context: %d own · %d parent · %d %s", len(s.Own), len(s.Parents), s.LinkEdges, links)
 	if s.Hidden > 0 {
 		fmt.Fprintf(w, " · ~%d hidden", s.Hidden)
 	}
 	fmt.Fprintln(w)
+}
+
+// renderSearch writes an `s` block (§5.5): matches as handle + home +
+// snippet with the further-matching-lines hint, then the searched footer.
+func renderSearch(w io.Writer, r *view.SearchResult) {
+	for _, m := range r.Matches {
+		fmt.Fprintf(w, "#%s %s %s %s", m.Handle, m.Subj, record.EncodePath(m.Path), m.Snippet)
+		if m.More > 0 {
+			fmt.Fprintf(w, " (+%d more)", m.More)
+		}
+		fmt.Fprintln(w)
+	}
+	matches, entries := "matches", "entries"
+	if len(r.Matches) == 1 {
+		matches = "match"
+	}
+	if r.Searched == 1 {
+		entries = "entry"
+	}
+	fmt.Fprintf(w, "%d %s · searched %d %s in context\n", len(r.Matches), matches, r.Searched, entries)
 }
 
 // voteLine renders the §9.3 follow evidence — the three heuristic checks,
@@ -220,9 +280,15 @@ func renderWorklist(w io.Writer, r *view.WorklistReport) {
 			g.Tip, len(g.Handles), notes, strings.Join(handles, " "), g.Hint, g.Tip)
 	}
 	total := len(r.Items) + len(r.Groups)
-	if total == 0 {
+	if total == 0 && r.Elsewhere == 0 {
 		fmt.Fprintln(w, "worklist clean")
 		return
 	}
-	fmt.Fprintf(w, "%d to review\n", total)
+	fmt.Fprintf(w, "%d to review", total)
+	if r.Elsewhere > 0 {
+		// The scoped default gives the global remainder as a count —
+		// bounded, never invisible (§9.6 layer 3).
+		fmt.Fprintf(w, " · %d elsewhere", r.Elsewhere)
+	}
+	fmt.Fprintln(w)
 }

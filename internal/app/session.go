@@ -6,6 +6,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"meltcloud.io/dm/internal/core/record"
 	"meltcloud.io/dm/internal/core/union"
@@ -19,14 +20,15 @@ var ErrNotInitialized = errors.New("not initialized — run dm init")
 
 // Session is app's per-invocation context (architecture.md §7): the lock,
 // the checkout snapshot, resumed monotonic minting, the store snapshot,
-// and the pending overlay. Evidence wiring and the stat accumulator arrive
-// with their milestones.
+// the pending overlay, and the stat-delta accumulator.
 type Session struct {
-	Repo   *gitio.Repo
-	Local  *local.Dir
-	Store  *store.Store
-	Head   record.SHA
-	Minter *record.Minter
+	Repo    *gitio.Repo
+	Local   *local.Dir
+	Store   *store.Store
+	Head    record.SHA
+	Minter  *record.Minter
+	Now     func() time.Time
+	Replica string
 
 	// StoreTip and StoreSet snapshot the local store mirror at open; the
 	// tip only moves at dm sync (§8.2), which holds this same lock.
@@ -42,9 +44,55 @@ type Session struct {
 	// batch append here too, so later commands read earlier writes.
 	Pending []record.Record
 
+	// PendingStats is the on-disk stat-delta accumulator at open (§8.1);
+	// deltas collects this invocation's events (§7.1), flushed into it at
+	// Close in one write. Both are deltas against the store's register
+	// file, not absolute values.
+	PendingStats union.Stats
+	deltas       union.Stats
+
 	storeRecords []record.Record
 
 	release func()
+}
+
+// BumpImpression records one collapsed showing in a surface (§7.1, weak).
+func (s *Session) BumpImpression(id record.EntryID) {
+	row := s.deltas[id]
+	row.I++
+	s.deltas[id] = row
+}
+
+// BumpExpansion records one `r:#handle` opening — the real click — and
+// refreshes the last-expanded LWW register (§7.1).
+func (s *Session) BumpExpansion(id record.EntryID) {
+	row := s.deltas[id]
+	row.X++
+	row.T = max(row.T, uint64(s.Now().UnixMilli()))
+	s.deltas[id] = row
+}
+
+// BumpSearchHit records one `s` match — distinct from impressions, never
+// correlated with a later expansion (§7.1).
+func (s *Session) BumpSearchHit(id record.EntryID) {
+	row := s.deltas[id]
+	row.H++
+	s.deltas[id] = row
+}
+
+// StatsView is the read-side merge of store ∪ pending (§8.1): the store's
+// per-replica register files with this replica's pending deltas (disk
+// accumulator + this invocation's events) folded into its own file.
+func (s *Session) StatsView() map[string]union.Stats {
+	out := make(map[string]union.Stats, len(s.StoreSet.Stats)+1)
+	for replica, stats := range s.StoreSet.Stats {
+		out[replica] = stats
+	}
+	own := union.AddStats(s.PendingStats, s.deltas)
+	if len(own) > 0 {
+		out[s.Replica] = union.AddStats(out[s.Replica], own)
+	}
+	return out
 }
 
 // OpenSession locks the clone and snapshots everything one invocation
@@ -68,6 +116,8 @@ func OpenSession(dir string, det Determinism, notice io.Writer) (*Session, error
 		Local:  l,
 		Store:  &store.Store{Repo: repo},
 		Minter: det.NewMinter(),
+		Now:    det.Now,
+		deltas: union.Stats{},
 
 		release: release,
 	}
@@ -84,6 +134,16 @@ func (s *Session) load() error {
 		return err
 	}
 	s.Head = head
+	if s.Replica, err = s.Local.ReplicaID(); err != nil {
+		return err
+	}
+	rawStats, err := s.Local.ReadPendingStats()
+	if err != nil {
+		return err
+	}
+	if s.PendingStats, err = union.ParseStats(rawStats); err != nil {
+		return fmt.Errorf("pending stats: %w", err)
+	}
 	if s.Qualified, err = qualified(s.Repo); err != nil {
 		return err
 	}
@@ -144,8 +204,17 @@ func (s *Session) View() []record.Record {
 	return out
 }
 
-// Close releases the invocation lock. (The stat-delta flush joins in M7.)
+// Close flushes this invocation's stat deltas into the pending accumulator
+// (one write, still under the lock — architecture.md §7) and releases the
+// invocation lock. A failed stat flush is swallowed: stats are advisory
+// signals and must never fail the read that produced them.
 func (s *Session) Close() {
+	if len(s.deltas) > 0 {
+		merged := union.AddStats(s.PendingStats, s.deltas)
+		_ = s.Local.WritePendingStats(union.FormatStats(merged))
+		s.PendingStats = merged
+		s.deltas = union.Stats{}
+	}
 	if s.release != nil {
 		s.release()
 		s.release = nil

@@ -7,8 +7,7 @@ import (
 )
 
 // The typed command vocabulary cli's parse constructs — inputs belong to
-// the callee (architecture.md §8). M3 carries the full CRUD grammar; `s`
-// (M7) and `vd` (M6) arrive with their milestones.
+// the callee (architecture.md §8).
 
 // Command is one parsed batch command.
 type Command interface {
@@ -51,6 +50,14 @@ type CmdRead struct {
 	Path    record.Path
 	Target  Ref
 	Depth   int
+}
+
+// CmdSearch is `s:path:t1|t2` (§5.5): search the node's entire
+// read-context. Terms is the OR of AND-groups (`a+b|c` → [[a b] [c]]).
+type CmdSearch struct {
+	RawText string
+	Path    record.Path
+	Terms   [][]string
 }
 
 // CmdSupersede is `u:#handle:body` (§6.1): a new body revision, anchors
@@ -127,6 +134,7 @@ type CmdVerdict struct {
 
 func (c CmdCreate) Raw() string    { return c.RawText }
 func (c CmdRead) Raw() string      { return c.RawText }
+func (c CmdSearch) Raw() string    { return c.RawText }
 func (c CmdSupersede) Raw() string { return c.RawText }
 func (c CmdTombstone) Raw() string { return c.RawText }
 func (c CmdReAnchor) Raw() string  { return c.RawText }

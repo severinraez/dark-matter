@@ -8,8 +8,8 @@ import (
 )
 
 // M4 exit bar (plan.md): the §11.4 sync scenarios — two-replica
-// convergence, non-ff retry, push-fail-fetch-only. Stat-counter merge is
-// unit-pinned in core/union until reads produce stats (M7).
+// convergence, non-ff retry, push-fail-fetch-only. The stat-counter merge
+// leg lives in stats_test.go.
 
 // newSharedRepo builds a repo with one committed file, wires it to a bare
 // remote, and initializes dm.
@@ -31,7 +31,7 @@ func TestSyncTwoReplicaConvergence(t *testing.T) {
 	// A notes a committed file and a dirty (uncommitted) one, then shares.
 	a.WriteFile("scratch.txt", "uncommitted content\n")
 	a.MustDM("a:api/handler.rb:c:Note from A\na:scratch.txt:d:Dirty-file note\n")
-	if got := a.MustDM("", "sync").Stdout; got != "pushed 2 · received 0\n" {
+	if got := a.MustDM("", "sync").Stdout; got != "pushed 2 · received 0\nworklist clean\n" {
 		t.Fatalf("A sync output %q", got)
 	}
 	if names := a.PendingRecordNames(); len(names) != 0 {
@@ -54,12 +54,15 @@ func TestSyncTwoReplicaConvergence(t *testing.T) {
 		t.Fatalf("store tree on B carries no anchored blob:\n%s", tree)
 	}
 
-	// B contributes and shares; A receives on its next sync.
+	// B contributes and shares; A receives on its next sync. B's health
+	// line (§8.4) counts A's dirty-file note: scratch.txt exists only in
+	// A's working tree, so on B it is orphaned — and it is not near B's
+	// session work, so it is the global remainder, never invisible (§9.6).
 	b.MustDM("a:api/handler.rb:c:Note from B\n")
-	if got := b.MustDM("", "sync").Stdout; got != "pushed 1 · received 0\n" {
+	if got := b.MustDM("", "sync").Stdout; got != "pushed 1 · received 0\n1 elsewhere\n" {
 		t.Fatalf("B sync output %q", got)
 	}
-	if got := a.MustDM("", "sync").Stdout; got != "pushed 0 · received 1\n" {
+	if got := a.MustDM("", "sync").Stdout; got != "pushed 0 · received 1\nworklist clean\n" {
 		t.Fatalf("A second sync output %q", got)
 	}
 
@@ -95,7 +98,7 @@ func TestSyncNonFFRetry(t *testing.T) {
 	if res.Code != 0 {
 		t.Fatalf("racing sync exit %d\nstdout: %s\nstderr: %s", res.Code, res.Stdout, res.Stderr)
 	}
-	if res.Stdout != "pushed 1 · received 1\n" {
+	if res.Stdout != "pushed 1 · received 1\nworklist clean\n" {
 		t.Fatalf("racing sync output %q", res.Stdout)
 	}
 	// Distinguishes the real rejection path from the race never happening
@@ -143,7 +146,7 @@ func TestSyncPushFailFetchOnly(t *testing.T) {
 	if res.Code == 0 {
 		t.Fatalf("degraded sync exited 0\nstdout: %s", res.Stdout)
 	}
-	if res.Stdout != "received 1 · push failed — pending kept (1)\n" {
+	if res.Stdout != "received 1 · push failed — pending kept (1)\nworklist clean\n" {
 		t.Fatalf("degraded sync output %q", res.Stdout)
 	}
 	if !strings.Contains(res.Stderr, "sync:") {
@@ -163,7 +166,7 @@ func TestSyncPushFailFetchOnly(t *testing.T) {
 	if err := os.Remove(hook); err != nil {
 		t.Fatal(err)
 	}
-	if got := a.MustDM("", "sync").Stdout; got != "pushed 1 · received 0\n" {
+	if got := a.MustDM("", "sync").Stdout; got != "pushed 1 · received 0\nworklist clean\n" {
 		t.Fatalf("recovery sync output %q", got)
 	}
 	if names := a.PendingRecordNames(); len(names) != 0 {
@@ -183,7 +186,7 @@ func TestSyncWithoutRemote(t *testing.T) {
 	r.Commit("c1")
 	r.MustDM("", "init")
 	r.MustDM("a:api/handler.rb:c:Local-only note\n")
-	if got := r.MustDM("", "sync").Stdout; got != "pushed 1 · received 0\n" {
+	if got := r.MustDM("", "sync").Stdout; got != "pushed 1 · received 0\nworklist clean\n" {
 		t.Fatalf("sync output %q", got)
 	}
 	if names := r.PendingRecordNames(); len(names) != 0 {
@@ -193,7 +196,7 @@ func TestSyncWithoutRemote(t *testing.T) {
 	if dump := r.MustDM("", "dump").Stdout; !strings.Contains(dump, "Local-only note") {
 		t.Fatalf("note lost across local sync:\n%s", dump)
 	}
-	if got := r.MustDM("", "sync").Stdout; got != "pushed 0 · received 0\n" {
+	if got := r.MustDM("", "sync").Stdout; got != "pushed 0 · received 0\nworklist clean\n" {
 		t.Fatalf("idempotent sync output %q", got)
 	}
 	res := r.MustDM("r:api/handler.rb\n")

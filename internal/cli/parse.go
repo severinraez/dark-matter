@@ -10,9 +10,7 @@ import (
 )
 
 // Phase 1 of the two-phase contract (§4.1): parse the entire input; any
-// syntax error rejects the whole batch and nothing executes. M3 carries
-// the full CRUD grammar; `s` (M7) and `vd` (M6) arrive with their
-// milestones.
+// syntax error rejects the whole batch and nothing executes.
 //
 // Grammar mechanics pinned here for good:
 //   - one command per line, `cmd:...`; fields split left-to-right on raw
@@ -121,7 +119,7 @@ func parseCommand(logical, raw string, line int, creates []bool) (app.Command, *
 	case "vd":
 		return parseVerdict(rest, raw, line)
 	case "s":
-		return nil, &ParseError{line, fmt.Sprintf("command %q not implemented yet", name)}
+		return parseSearch(rest, raw, line)
 	default:
 		return nil, &ParseError{line, fmt.Sprintf("unknown command %q", name)}
 	}
@@ -184,6 +182,32 @@ func parseRead(rest, raw string, line int, creates []bool) (app.Command, *ParseE
 		depth = n
 	}
 	return app.CmdRead{RawText: raw, Path: path, Depth: depth}, nil
+}
+
+// parseSearch parses `s:path:t1|t2` (§5.5). The term field is final and
+// greedy, never percent-decoded; `|` = OR and `+` = AND with `+` binding
+// tighter, so `a+b|c` parses to [[a b] [c]].
+func parseSearch(rest, raw string, line int) (app.Command, *ParseError) {
+	pathField, termField, ok := strings.Cut(rest, ":")
+	if !ok {
+		return nil, &ParseError{line, "expected s:path:t1|t2"}
+	}
+	path, perr := parsePathField(pathField, line)
+	if perr != nil {
+		return nil, perr
+	}
+	var groups [][]string
+	for _, g := range strings.Split(termField, "|") {
+		var terms []string
+		for _, t := range strings.Split(g, "+") {
+			if t == "" {
+				return nil, &ParseError{line, "empty search term"}
+			}
+			terms = append(terms, t)
+		}
+		groups = append(groups, terms)
+	}
+	return app.CmdSearch{RawText: raw, Path: path, Terms: groups}, nil
 }
 
 // parseSupersede parses `u:#handle:body` (§4.2); body greedy as always.

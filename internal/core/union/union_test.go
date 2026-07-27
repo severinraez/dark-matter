@@ -111,12 +111,17 @@ func TestWithOwnRecontributesAcrossEpochs(t *testing.T) {
 	compacted := NewSet()
 	compacted.Epoch = 1
 	merged := Merge(NewSet(), compacted)
-	got := WithOwn(merged, map[record.RecID][]byte{rid(t, recC): []byte("own\n")}, []record.SHA{"cc22"})
+	e := eid(t, ent1)
+	got := WithOwn(merged, map[record.RecID][]byte{rid(t, recC): []byte("own\n")}, []record.SHA{"cc22"},
+		"AAAAAAAA", Stats{e: {I: 2, T: 500}})
 	if string(got.Records[rid(t, recC)]) != "own\n" {
 		t.Fatal("own pending record not contributed")
 	}
 	if !got.Blobs["cc22"] {
 		t.Fatal("own staged blob not contributed")
+	}
+	if got.Stats["AAAAAAAA"][e] != (Row{I: 2, T: 500}) {
+		t.Fatalf("own stat deltas not contributed: %+v", got.Stats["AAAAAAAA"][e])
 	}
 	if got.Epoch != 1 {
 		t.Fatalf("epoch %d, want 1", got.Epoch)

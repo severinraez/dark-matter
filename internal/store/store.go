@@ -6,7 +6,6 @@ package store
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -94,7 +93,7 @@ func (s *Store) Read(tip *record.SHA) (union.Set, error) {
 	}
 	for sha, replicas := range statReplica {
 		for _, replica := range replicas {
-			stats, err := parseStats(contents[sha])
+			stats, err := union.ParseStats(contents[sha])
 			if err != nil {
 				return union.Set{}, fmt.Errorf("stats/%s: %w", replica, err)
 			}
@@ -148,8 +147,8 @@ func (s *Store) Commit(set union.Set, base *record.SHA, baseSet union.Set, blobS
 		add = append(add, gitio.TreeEntry{SHA: sha, Path: blobPath(blob)})
 	}
 	for replica, stats := range set.Stats {
-		serialized := formatStats(stats)
-		if baseStats, ok := baseSet.Stats[replica]; ok && string(formatStats(baseStats)) == string(serialized) {
+		serialized := union.FormatStats(stats)
+		if baseStats, ok := baseSet.Stats[replica]; ok && string(union.FormatStats(baseStats)) == string(serialized) {
 			continue
 		}
 		sha, err := s.Repo.WriteBlob(serialized)
@@ -195,66 +194,4 @@ func recordPath(id record.RecID) string {
 // blobPath content-addresses like git's odb layout (§8.1).
 func blobPath(sha record.SHA) string {
 	return "blobs/" + string(sha[:2]) + "/" + string(sha[2:])
-}
-
-// ---- stats file codec (§8.1) ----
-//
-// One file per replica, one row per entry that has stats:
-// `<entry-id> i:<n> x:<n> h:<n> t:<ms>`. Canonical form writes every field
-// in that order, rows sorted by entry-id; the parser takes any subset
-// (missing field = zero, §7.2).
-
-func formatStats(stats union.Stats) []byte {
-	ids := make([]string, 0, len(stats))
-	byID := make(map[string]union.Row, len(stats))
-	for id, row := range stats {
-		ids = append(ids, id.String())
-		byID[id.String()] = row
-	}
-	sort.Strings(ids)
-	var b strings.Builder
-	for _, id := range ids {
-		row := byID[id]
-		fmt.Fprintf(&b, "%s i:%d x:%d h:%d t:%d\n", id, row.I, row.X, row.H, row.T)
-	}
-	return []byte(b.String())
-}
-
-func parseStats(content []byte) (union.Stats, error) {
-	stats := union.Stats{}
-	for _, line := range strings.Split(string(content), "\n") {
-		if line == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		id, err := record.ParseEntryID(fields[0])
-		if err != nil {
-			return nil, err
-		}
-		var row union.Row
-		for _, f := range fields[1:] {
-			key, val, ok := strings.Cut(f, ":")
-			if !ok {
-				return nil, fmt.Errorf("bad stat field %q", f)
-			}
-			n, err := strconv.ParseUint(val, 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("bad stat field %q: %w", f, err)
-			}
-			switch key {
-			case "i":
-				row.I = n
-			case "x":
-				row.X = n
-			case "h":
-				row.H = n
-			case "t":
-				row.T = n
-			default:
-				return nil, fmt.Errorf("unknown stat field %q", f)
-			}
-		}
-		stats[id] = row
-	}
-	return stats, nil
 }

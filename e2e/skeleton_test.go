@@ -12,7 +12,7 @@ import (
 // end-to-end against a real repo, and §2.1 rows 2 and 7 pass. Pending
 // alone carries the slice — no store branch yet.
 
-var createdRe = regexp.MustCompile(`^\+ #([0-9a-hjkmnp-tv-z]{6}) created$`)
+var createdRe = regexp.MustCompile(`^\+ #([0-9a-hjkmnp-tv-z]{6}) created(?: · .*)?$`)
 
 // createdHandle extracts the minted handle from an `a` ack block.
 func createdHandle(t *testing.T, stdout string) string {
@@ -75,12 +75,18 @@ func TestWorkedExample(t *testing.T) {
 	}
 
 	// dm dump: the ground truth is exactly one CR record carrying every
-	// §8.6 field: rec-id, entry-id, subj, anchor blob, origin, path, body.
+	// §8.6 field — rec-id, entry-id, subj, anchor blob, origin, path,
+	// body — plus this replica's stat row from the read above (one
+	// impression, §7.1/§11.3).
 	res = r.MustDM("", "dump")
-	dumpRe := regexp.MustCompile(`^CR [0-9A-HJKMNP-TV-Z]{26} [0-9A-HJKMNP-TV-Z]{26} c ` +
-		blob + ` ` + head + ` api/handler\.rb Validates tenant header before dispatch\n$`)
-	if !dumpRe.MatchString(res.Stdout) {
+	dumpRe := regexp.MustCompile(`^CR [0-9A-HJKMNP-TV-Z]{26} ([0-9A-HJKMNP-TV-Z]{26}) c ` +
+		blob + ` ` + head + ` api/handler\.rb Validates tenant header before dispatch\n` +
+		`stat E2EREPL1 ([0-9A-HJKMNP-TV-Z]{26}) i:1 x:0 h:0 t:0\n$`)
+	m := dumpRe.FindStringSubmatch(res.Stdout)
+	if m == nil {
 		t.Errorf("dump output %q does not match %v", res.Stdout, dumpRe)
+	} else if m[1] != m[2] {
+		t.Errorf("stat row keys %s, want the entry-id %s", m[2], m[1])
 	}
 }
 

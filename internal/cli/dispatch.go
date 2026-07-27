@@ -21,7 +21,7 @@ With no subcommand, dm reads a batch of commands from stdin (one per line).
 Subcommands:
   init      create .git/.dm/, configure the refs/dm/* refspec, fetch or create the store
   sync      share: fold pending, fetch, union merge, push with retry
-  worklist  the hygiene query
+  worklist  the hygiene query (--all: drop session scoping · --stale: include stale/unconfirmed)
   gc        compact the store
   dump      print full raw store state (tests and debugging)
 `
@@ -47,8 +47,20 @@ func Dispatch(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return app.Sync(".", det, opts, stdout, stderr)
 		})
 	case "worklist":
+		var opts app.WorklistOptions
+		for _, arg := range args[1:] {
+			switch arg {
+			case "--all":
+				opts.All = true
+			case "--stale":
+				opts.Stale = true
+			default:
+				fmt.Fprintf(stderr, "dm worklist: unknown flag %q (have --all, --stale)\n", arg)
+				return 2
+			}
+		}
 		return run(stderr, func(det app.Determinism) error {
-			report, err := app.Worklist(".", det, stderr)
+			report, err := app.Worklist(".", det, opts, stderr)
 			if err != nil {
 				return err
 			}

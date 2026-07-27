@@ -187,9 +187,12 @@ func TestLinks(t *testing.T) {
 		t.Errorf("expansions:\n%q\nwant to contain:\n%q\nand:\n%q", res.Stdout, wantA, wantB)
 	}
 
-	// The surface footer counts the live edge.
-	if got := r.MustDM("r:api/a.rb\n").Stdout; !strings.Contains(got, "context: 1 own · 0 parent · 1 link\n") {
-		t.Errorf("surface link count:\n%q", got)
+	// The surface shows the far endpoint as handle + label — collapsed,
+	// its body a size in the hidden tally (§5.1) — and the footer counts
+	// the live edge.
+	want := "→ #" + hB + " depends on B\ncontext: 1 own · 0 parent · 1 link · ~1 hidden\n"
+	if got := r.MustDM("r:api/a.rb\n").Stdout; !strings.Contains(got, want) {
+		t.Errorf("surface link dimension:\n%q\nwant to contain %q", got, want)
 	}
 
 	// Unlink; a second dl finds nothing — per-command error, batch intact.

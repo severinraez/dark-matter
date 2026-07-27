@@ -8,6 +8,7 @@ import (
 
 	"meltcloud.io/dm/internal/core/record"
 	"meltcloud.io/dm/internal/core/union"
+	"meltcloud.io/dm/internal/core/view"
 	"meltcloud.io/dm/internal/gitio"
 	"meltcloud.io/dm/internal/store"
 )
@@ -24,28 +25,24 @@ type SyncOptions struct {
 	SkipFetch bool
 }
 
-// mintForSync runs the load-bearing mint moment (§9.4): m1 plus the heavy
-// matchers over the post-fetch store ∪ pending, right after fetch — while
-// the author's clone holds both the local branch refs (the evidence) and
-// the fresh target line, before forge branch auto-delete and GC destroy
-// the evidence. Degraded clones never mint.
-func (s *Session) mintForSync(pairs []forcedUpdate) error {
-	if !s.Qualified {
-		return nil
-	}
+// currentView reads the store mirror's present tip ∪ pending in rec-id
+// order — the view sync-time consumers (mint pass, health line) need,
+// while the session's own mirror snapshot stays pre-fetch for the epoch
+// rule (§8.4).
+func (s *Session) currentView() ([]record.Record, error) {
 	tip, err := s.Store.Tip()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	set, err := s.Store.Read(tip)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	view := make([]record.Record, 0, len(set.Records)+len(s.Pending))
 	for id, data := range set.Records {
 		rec, err := record.Decode(data)
 		if err != nil {
-			return fmt.Errorf("store record %s: %w", id, err)
+			return nil, fmt.Errorf("store record %s: %w", id, err)
 		}
 		view = append(view, rec)
 	}
@@ -55,6 +52,22 @@ func (s *Session) mintForSync(pairs []forcedUpdate) error {
 		}
 	}
 	sort.Slice(view, func(i, j int) bool { return view[i].ID().Less(view[j].ID()) })
+	return view, nil
+}
+
+// mintForSync runs the load-bearing mint moment (§9.4): m1 plus the heavy
+// matchers over the post-fetch store ∪ pending, right after fetch — while
+// the author's clone holds both the local branch refs (the evidence) and
+// the fresh target line, before forge branch auto-delete and GC destroy
+// the evidence. Degraded clones never mint.
+func (s *Session) mintForSync(pairs []forcedUpdate) error {
+	if !s.Qualified {
+		return nil
+	}
+	view, err := s.currentView()
+	if err != nil {
+		return err
+	}
 	ex, err := s.newExecutorFrom(view)
 	if err != nil {
 		return err
@@ -63,6 +76,31 @@ func (s *Session) mintForSync(pairs []forcedUpdate) error {
 		return err
 	}
 	return ex.mintPass(pairs)
+}
+
+// healthLine computes the §8.4 sync footer: one line of worklist counts,
+// session-scoped then global, over the post-sync state. The session scope
+// is the work this sync shared (pending at open) — each backlog item
+// lands in front of the session best equipped to judge it (§9.6).
+func (s *Session) healthLine() (string, error) {
+	recs, err := s.currentView()
+	if err != nil {
+		return "", err
+	}
+	ex, err := s.newExecutorFrom(recs)
+	if err != nil {
+		return "", err
+	}
+	data, err := ex.collectWorklist()
+	if err != nil {
+		return "", err
+	}
+	scope, err := ex.sessionScope()
+	if err != nil {
+		return "", err
+	}
+	scoped, elsewhere := healthTally(data, scope)
+	return view.HealthLine(scoped, elsewhere), nil
 }
 
 // maxPushAttempts bounds the retry loop. Each retry only ever adds, so a
@@ -145,6 +183,10 @@ func Sync(dir string, det Determinism, opts SyncOptions, stdout, stderr io.Write
 		content, err := s.Local.ReadPendingBlob(sha)
 		return content, err == nil
 	}
+	// The stat-delta accumulator folds into this replica's register file
+	// (add counters, max t — §8.1) and, like pending records, clears only
+	// on a successful push.
+	ownStats := s.PendingStats
 
 	var fetched union.Set
 	var pushErr error
@@ -160,7 +202,7 @@ func Sync(dir string, det Determinism, opts SyncOptions, stdout, stderr io.Write
 		// The epoch rule runs against the pre-fetch mirror (s.StoreSet):
 		// under a newer fetched epoch the merge adopts the fetched tree
 		// wholesale and only pending — own unpushed records — re-enters.
-		merged := union.WithOwn(union.Merge(s.StoreSet, fetched), own, ownBlobs)
+		merged := union.WithOwn(union.Merge(s.StoreSet, fetched), own, ownBlobs, s.Replica, ownStats)
 		commit, err := s.Store.Commit(merged, tip, fetched, blobSrc, det.Now())
 		if err != nil {
 			return err
@@ -200,23 +242,36 @@ func Sync(dir string, det Determinism, opts SyncOptions, stdout, stderr io.Write
 			received++
 		}
 	}
+	health, healthErr := s.healthLine()
 	if pushed {
 		if err := s.Local.ClearPending(ownIDs, ownBlobs); err != nil {
 			return err
 		}
+		if err := s.Local.ClearPendingStats(); err != nil {
+			return err
+		}
+		s.PendingStats = union.Stats{} // never re-flushed at Close
 		shared := 0
 		for id := range own {
 			if _, had := fetched.Records[id]; !had {
 				shared++
 			}
 		}
-		// Placeholder summary until the §9.6 health line lands (M7).
 		fmt.Fprintf(stdout, "pushed %d · received %d\n", shared, received)
+		if healthErr != nil {
+			return healthErr
+		}
+		// The backlog is surfaced at every share point, never demanded
+		// (§8.4, §9.6 layer 4).
+		fmt.Fprintln(stdout, health)
 		return nil
 	}
 	// Fetch-only degradation (§8.4): the merge above already applied
 	// locally via the fetched mirror; pending stays intact for the next
 	// successful sync.
 	fmt.Fprintf(stdout, "received %d · push failed — pending kept (%d)\n", received, len(ownIDs))
+	if healthErr == nil {
+		fmt.Fprintln(stdout, health)
+	}
 	return fmt.Errorf("sync: %w", pushErr)
 }
