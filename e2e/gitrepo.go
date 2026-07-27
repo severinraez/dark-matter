@@ -25,6 +25,8 @@ type Repo struct {
 	t           *testing.T
 	Dir         string
 	ReplicaID   string
+	seedBase    int64 // per-replica id-seed base: shared seeds would mint colliding ULIDs
+	clockOff    int64 // per-replica clock skew (ms), so LWW order across replicas is pinned
 	invocations int64
 	commits     int
 }
@@ -32,12 +34,48 @@ type Repo struct {
 // NewRepo creates an empty repository with pinned identity and branch name.
 func NewRepo(t *testing.T) *Repo {
 	t.Helper()
-	r := &Repo{t: t, Dir: t.TempDir(), ReplicaID: "E2EREPL1"}
+	r := &Repo{t: t, Dir: t.TempDir(), ReplicaID: "E2EREPL1", seedBase: 40000}
 	r.Git("init", "-q", "-b", "main")
+	r.pinConfig()
+	return r
+}
+
+// NewBareRemote creates a bare repository to stand in for the forge remote
+// in multi-replica sync scenarios.
+func NewBareRemote(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	cmd := exec.Command("git", "init", "-q", "--bare", "-b", "main", dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+	return dir
+}
+
+// CloneRepo clones the remote as replica n (n ≥ 2): distinct pinned
+// replica id, id-seed range, and clock skew, so two replicas never mint
+// colliding ULIDs and cross-replica LWW outcomes are reproducible.
+func CloneRepo(t *testing.T, remote string, n int) *Repo {
+	t.Helper()
+	r := &Repo{
+		t:         t,
+		Dir:       t.TempDir(),
+		ReplicaID: fmt.Sprintf("E2EREPL%d", n),
+		seedBase:  40000 + int64(n-1)*10000,
+		clockOff:  int64(n-1) * 500,
+	}
+	cmd := exec.Command("git", "clone", "-q", remote, r.Dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+	r.pinConfig()
+	return r
+}
+
+func (r *Repo) pinConfig() {
 	r.Git("config", "user.name", "dm fixture")
 	r.Git("config", "user.email", "dm@example.invalid")
 	r.Git("config", "commit.gpgsign", "false")
-	return r
 }
 
 // Git runs one git command in the repo and returns trimmed stdout.
@@ -89,12 +127,18 @@ func (r *Repo) HashObject(path string) string {
 // instant and id seed per invocation, one replica id per Repo.
 func (r *Repo) DM(stdin string, args ...string) Result {
 	r.t.Helper()
+	return r.DMEnv(nil, stdin, args...)
+}
+
+// DMEnv is DM with extra environment entries (e.g. DM_SKIP_FETCH).
+func (r *Repo) DMEnv(extra []string, stdin string, args ...string) Result {
+	r.t.Helper()
 	r.invocations++
-	env := []string{
-		fmt.Sprintf("DM_CLOCK=%d", baseClock+r.invocations*1000),
-		fmt.Sprintf("DM_ID_SEED=%d", 40000+r.invocations),
+	env := append([]string{
+		fmt.Sprintf("DM_CLOCK=%d", baseClock+r.clockOff+r.invocations*1000),
+		fmt.Sprintf("DM_ID_SEED=%d", r.seedBase+r.invocations),
 		"DM_REPLICA_ID=" + r.ReplicaID,
-	}
+	}, extra...)
 	return RunDM(r.t, r.Dir, stdin, env, args...)
 }
 
@@ -111,3 +155,18 @@ func (r *Repo) MustDM(stdin string, args ...string) Result {
 
 // DMDir returns the clone-local state dir.
 func (r *Repo) DMDir() string { return filepath.Join(r.Dir, ".git", ".dm") }
+
+// PendingRecordNames lists the pending record filenames — how scenarios
+// assert push-clears-pending and fetch-only-keeps-pending (§8.4).
+func (r *Repo) PendingRecordNames() []string {
+	r.t.Helper()
+	entries, err := os.ReadDir(filepath.Join(r.DMDir(), "pending", "records"))
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}

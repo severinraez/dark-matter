@@ -1,8 +1,8 @@
 // Package local owns .git/.dm/* (design.md §8.2): pending records, blobs
 // and stats, the replica id, cache file mechanics, and the invocation lock.
-// Cache keys and invalidation semantics are dictated from above. M2 carries
-// the walking-skeleton subset — pending append/scan, blob staging, replica,
-// lock; the cache mechanics arrive with M4/M5.
+// Cache keys and invalidation semantics are dictated from above. M2–M4
+// carry pending append/scan/clear, blob staging, replica, and lock; the
+// cache mechanics arrive with M5.
 package local
 
 import (
@@ -116,6 +116,46 @@ func (d *Dir) ScanPendingRecords() ([]PendingRecord, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+// ScanPendingBlobs lists the staged anchored-blob SHAs (§8.1), sorted.
+func (d *Dir) ScanPendingBlobs() ([]record.SHA, error) {
+	entries, err := os.ReadDir(d.pendingBlobsDir())
+	if err != nil {
+		return nil, err
+	}
+	var out []record.SHA
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), "tmp-") {
+			continue
+		}
+		out = append(out, record.SHA(e.Name()))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
+// ReadPendingBlob returns one staged blob's content.
+func (d *Dir) ReadPendingBlob(sha record.SHA) ([]byte, error) {
+	return os.ReadFile(filepath.Join(d.pendingBlobsDir(), string(sha)))
+}
+
+// ClearPending removes exactly the named pending files — called only after
+// the push that carried them landed (§8.4: pending clears on successful
+// push, never on fold). Under the invocation lock nothing else can have
+// appended meanwhile, but clearing by name keeps that true by construction.
+func (d *Dir) ClearPending(records []record.RecID, blobs []record.SHA) error {
+	for _, id := range records {
+		if err := os.Remove(filepath.Join(d.pendingRecordsDir(), id.String())); err != nil {
+			return err
+		}
+	}
+	for _, sha := range blobs {
+		if err := os.Remove(filepath.Join(d.pendingBlobsDir(), string(sha))); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // StageBlob stages anchored content the odb lacks under pending/blobs/<sha>

@@ -12,9 +12,10 @@ right commit, any merge strategy — queried through a token-efficient batch CLI
 - [architecture.md](architecture.md) — module boundaries, the Evidence port,
   core decomposition, repo layout (A§N references).
 - [plan.md](plan.md) — milestone ordering and dependency decisions.
-  **Current state: M3 (fold + full CRUD)** — every write verb and reads
-  against pending; no store branch, sync, or resolution layers beyond
-  exact-blob yet.
+  **Current state: M4 (store + sync)** — every write verb, reads against
+  store ∪ pending, and `dm sync` (shared `refs/dm/store` branch, CRDT
+  union merge, push retry, fetch-only degradation); no mint pass or
+  resolution layers beyond exact-blob yet.
 
 ## Build
 
@@ -31,13 +32,15 @@ go build -o bin/dm ./cmd/dm    # build the dm binary
 
 ```sh
 cd /path/to/some/git/repo
-dm init                        # once per clone: creates .git/.dm/
+dm init                        # once per clone: creates .git/.dm/, fetches or creates the store
 
 dm <<'EOF'                     # no subcommand = batch over stdin, one command per line
 a:api/handler.rb:c:Validates tenant header before dispatch
 r:api/handler.rb
 EOF
 
+dm sync                        # share: fetch, union merge, push (retries a lost
+                               # race; a failed push degrades to fetch-only)
 dm dump                        # raw store ∪ pending state (tests/debugging)
 dm help                        # subcommand overview
 ```
@@ -48,8 +51,9 @@ Batch grammar is §4 of design.md: `a:path:subj:body` creates a note
 flag by handle; `al`/`dl` link and unlink entries; `mv`/`rm` relocate or
 retire whole paths; `$N` references the entry created by the batch's Nth
 command. Use a quoted heredoc (`<<'EOF'`) so the shell doesn't eat `\`
-continuations or `$N`. `sync`, `worklist`, and `gc` arrive with later
-milestones (plan.md M4+).
+continuations or `$N`. Notes live in `.git/.dm/pending` until `dm sync`
+folds them into the shared `refs/dm/store` branch (design.md §8);
+`worklist` and `gc` arrive with later milestones (plan.md M6+).
 
 ## Develop
 

@@ -41,7 +41,12 @@ func Dispatch(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return run(stderr, func(det app.Determinism) error {
 			return app.Dump(".", det, stdout, stderr)
 		})
-	case "sync", "worklist", "gc":
+	case "sync":
+		return run(stderr, func(det app.Determinism) error {
+			opts := app.SyncOptions{SkipFetch: os.Getenv(app.EnvSkipFetch) != ""}
+			return app.Sync(".", det, opts, stdout, stderr)
+		})
+	case "worklist", "gc":
 		fmt.Fprintf(stderr, "dm %s: not implemented yet\n", args[0])
 		return 1
 	case "help", "-h", "--help":

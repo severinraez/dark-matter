@@ -4,8 +4,9 @@
 //
 // gitio interprets nothing: it answers questions git can answer; every
 // threshold, band, and guard lives in core. M2 carries the walking-skeleton
-// subset — hash-object, rev-parse, ancestry; the similarity/forensics
-// surface arrives with M5/M6.
+// subset (hash-object, rev-parse, ancestry), M4 the object/ref/transport
+// plumbing (plumbing.go); the similarity/forensics surface arrives with
+// M5/M6.
 package gitio
 
 import (

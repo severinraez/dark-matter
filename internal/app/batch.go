@@ -97,9 +97,8 @@ func (s *Session) ExecuteBatch(cmds []Command) (BatchResult, error) {
 	return res, nil
 }
 
-// executor carries the batch-scoped view over store ∪ pending (M3: pending
-// only — the store branch arrives with M4) plus memos that hold for one
-// checkout snapshot.
+// executor carries the batch-scoped view over store ∪ pending plus memos
+// that hold for one checkout snapshot.
 type executor struct {
 	s        *Session
 	records  map[record.EntryID][]record.Record // per-entry CR/SU/TB/RA/RP/FB
@@ -123,9 +122,9 @@ func (s *Session) newExecutor() (*executor, error) {
 		folded:  make(map[record.EntryID]fold.Entry),
 		made:    make(map[int]record.EntryID),
 	}
-	// Replay in rec-id order so handle extension resolves exactly as it
-	// did at each mint (§3.5); Pending is already sorted.
-	for _, rec := range s.Pending {
+	// Replay store ∪ pending in rec-id order so handle extension resolves
+	// exactly as it did at each mint (§3.5).
+	for _, rec := range s.View() {
 		if err := ex.absorb(rec); err != nil {
 			return nil, err
 		}
@@ -692,8 +691,9 @@ func (ex *executor) remove(c CmdRemove) ([]MacroItem, string) {
 // stageBlobIfUncommitted stages described bytes the odb lacks to
 // pending/blobs (§8.1) so truly uncommitted content stays fetchable. The
 // staged bytes are the raw working-tree file; if checkin filters rewrite
-// content the staged bytes can diverge from the blob — reconciled when the
-// store materializes blobs (M4).
+// content the staged bytes can diverge from the anchor SHA — the store
+// writes them as-is under the anchor's path, which stays the address
+// (store.Commit).
 func (ex *executor) stageBlobIfUncommitted(blob record.SHA, path record.Path) error {
 	has, err := ex.s.Repo.HasObject(blob)
 	if err != nil || has {
