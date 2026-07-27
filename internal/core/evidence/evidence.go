@@ -85,6 +85,10 @@ type Tree interface {
 	// PathsOf lists the checkout paths holding blob, including
 	// working-tree dirt.
 	PathsOf(blob record.SHA) ([]record.Path, error)
+	// PathsUnder lists the checkout paths inside a folder — rule (a)
+	// folder layer 1 (existence) and the §9.3 absorbed check (foreign
+	// member fraction). Includes working-tree dirt.
+	PathsUnder(folder record.Path) ([]record.Path, error)
 	// TreeAt returns the folder fingerprint at path in commit's tree; nil
 	// means the path is absent there.
 	TreeAt(commit record.SHA, path record.Path) (*TreeFP, error)

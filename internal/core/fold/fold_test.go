@@ -48,7 +48,7 @@ func cr(n int, body string) record.Create {
 func TestFoldCreateOnly(t *testing.T) {
 	got := Fold(entry, []record.Record{cr(1, "v1")}, landedMain)
 	want := Entry{ID: entry, Landed: true, Subj: record.SubjCode,
-		Anchor: record.BlobAnchor("11f1"), Path: "a.rb", Body: "v1", Rev: 1}
+		Anchor: record.BlobAnchor("11f1"), Path: "a.rb", Body: "v1", Origin: originMain, Rev: 1}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("fold mismatch (-want +got):\n%s", diff)
 	}
@@ -60,7 +60,7 @@ func TestFoldSupersedeWins(t *testing.T) {
 	// Order-independent: records arrive shuffled, the fold sorts.
 	got := Fold(entry, []record.Record{su, cr(1, "v1")}, landedMain)
 	want := Entry{ID: entry, Landed: true, Subj: record.SubjDev,
-		Anchor: record.BlobAnchor("22f2"), Path: "b.rb", Body: "v2", Rev: 2}
+		Anchor: record.BlobAnchor("22f2"), Path: "b.rb", Body: "v2", Origin: originMain, Rev: 2}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("fold mismatch (-want +got):\n%s", diff)
 	}
@@ -113,7 +113,7 @@ func TestFoldReAnchor(t *testing.T) {
 	got := Fold(entry, []record.Record{cr(1, "v1"), ra}, landedMain)
 	// Anchor and path re-stamped; body untouched — RA is no revision.
 	want := Entry{ID: entry, Landed: true, Subj: record.SubjCode,
-		Anchor: record.BlobAnchor("22f2"), Path: "moved.rb", Body: "v1", Rev: 1}
+		Anchor: record.BlobAnchor("22f2"), Path: "moved.rb", Body: "v1", Origin: originMain, Rev: 1}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("fold mismatch (-want +got):\n%s", diff)
 	}
@@ -149,6 +149,28 @@ func TestFoldUnlandedRePath(t *testing.T) {
 	}
 }
 
+// PinnedPath arms resolution layer 4 (§9.1): set exactly while the newest
+// landed path-affecting record is an RP; a later landed confirming write
+// retires it.
+func TestFoldPinnedPath(t *testing.T) {
+	rp := record.RePath{Rec: rid(2), Entry: entry, Origin: originMain, Path: "new.rb"}
+	got := Fold(entry, []record.Record{cr(1, "v1"), rp}, landedMain)
+	if !got.PinnedPath {
+		t.Errorf("folded %+v, want PinnedPath after a landed RP", got)
+	}
+	ra := record.ReAnchor{Rec: rid(3), Entry: entry,
+		Anchor: record.BlobAnchor("22f2"), Origin: originMain, Path: "new.rb"}
+	got = Fold(entry, []record.Record{cr(1, "v1"), rp, ra}, landedMain)
+	if got.PinnedPath {
+		t.Errorf("folded %+v, want the k to retire the pin", got)
+	}
+	rpBranch := record.RePath{Rec: rid(4), Entry: entry, Origin: originBranch, Path: "elsewhere.rb"}
+	got = Fold(entry, []record.Record{cr(1, "v1"), rpBranch}, landedMain)
+	if got.PinnedPath {
+		t.Errorf("folded %+v, want no pin from an unlanded RP", got)
+	}
+}
+
 // Rescue fold (§8.3): a landed RA carries the entry alone — body from the
 // newest CR/SU preceding it (the revision its writer acted on), anchor
 // from the RA.
@@ -159,7 +181,7 @@ func TestFoldRescueViaReAnchor(t *testing.T) {
 		Anchor: record.BlobAnchor("22f2"), Origin: originMain, Path: "rescued.rb"}
 	got := Fold(entry, []record.Record{crBranch, ra}, landedMain)
 	want := Entry{ID: entry, Landed: true, Subj: record.SubjCode,
-		Anchor: record.BlobAnchor("22f2"), Path: "rescued.rb", Body: "branch body", Rev: 1}
+		Anchor: record.BlobAnchor("22f2"), Path: "rescued.rb", Body: "branch body", Origin: originMain, Rev: 1}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("fold mismatch (-want +got):\n%s", diff)
 	}

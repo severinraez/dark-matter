@@ -7,6 +7,7 @@ import (
 
 	"meltcloud.io/dm/internal/app"
 	"meltcloud.io/dm/internal/core/record"
+	"meltcloud.io/dm/internal/core/resolve"
 	"meltcloud.io/dm/internal/core/view"
 )
 
@@ -68,14 +69,43 @@ func renderAck(w io.Writer, a view.Ack) {
 	}
 }
 
-// renderSurface writes own-entry previews and the inventory footer (§5.1):
-// every collapsed item carries its size, and the context line is the "how
-// much more is there" signal.
+// flagSuffix renders an entry's ⚠-flags, leading space included.
+func flagSuffix(flags []view.Flag) string {
+	var b strings.Builder
+	for _, f := range flags {
+		b.WriteString(" ⚠")
+		b.WriteString(string(f))
+	}
+	return b.String()
+}
+
+// renderSurface writes own-entry previews, the collapsed parent line, and
+// the inventory footer (§5.1): every collapsed item carries its size, and
+// the context line is the "how much more is there" signal.
 func renderSurface(w io.Writer, s *view.Surface) {
 	for _, p := range s.Own {
 		fmt.Fprintf(w, "%s #%s %s", p.Subj, p.Handle, p.FirstLine)
 		if p.MoreLines > 0 {
 			fmt.Fprintf(w, " (+%d lines)", p.MoreLines)
+		}
+		fmt.Fprint(w, flagSuffix(p.Flags))
+		fmt.Fprintln(w)
+	}
+	if len(s.Parents) > 0 {
+		notes, arch := "notes", 0
+		var called []string
+		for _, p := range s.Parents {
+			if p.Subj == record.SubjArch {
+				arch++
+				called = append(called, fmt.Sprintf("#%s %s%s", p.Handle, record.EncodePath(p.Path), flagSuffix(p.Flags)))
+			}
+		}
+		if len(s.Parents) == 1 {
+			notes = "note"
+		}
+		fmt.Fprintf(w, "↑ %d parent %s", len(s.Parents), notes)
+		if arch > 0 {
+			fmt.Fprintf(w, " (%d arch) %s", arch, strings.Join(called, " · "))
 		}
 		fmt.Fprintln(w)
 	}
@@ -83,18 +113,50 @@ func renderSurface(w io.Writer, s *view.Surface) {
 	if s.Links == 1 {
 		links = "link"
 	}
-	fmt.Fprintf(w, "context: %d own · %d parent · %d %s", len(s.Own), s.Parents, s.Links, links)
+	fmt.Fprintf(w, "context: %d own · %d parent · %d %s", len(s.Own), len(s.Parents), s.Links, links)
 	if s.Hidden > 0 {
 		fmt.Fprintf(w, " · ~%d hidden", s.Hidden)
 	}
 	fmt.Fprintln(w)
 }
 
-// renderExpansion writes an `r:#handle` block (§5.3): header, full body
-// raw, then links one level and relations — the §4.3 structure glyphs.
+// voteLine renders the §9.3 follow evidence — the three heuristic checks,
+// shown instead of re-derived: candidates as `path votes/paired`, coverage,
+// and the absorbed foreign fraction.
+func voteLine(v *resolve.Vote) string {
+	var parts []string
+	for _, c := range v.Candidates {
+		parts = append(parts, fmt.Sprintf("%s %d/%d", record.EncodePath(c.Path), c.Score, v.Paired))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "no candidate")
+	}
+	line := "→ " + strings.Join(parts, " · ") + fmt.Sprintf(" · cov %d%%", v.CoveragePct)
+	if v.ForeignPct > 0 {
+		line += fmt.Sprintf(" · target %d%% foreign", v.ForeignPct)
+	}
+	return line
+}
+
+// runnersLine renders a file note's competing candidates (ambiguity
+// policy, §9.1): dm's pick leads, scores attached.
+func runnersLine(cands []resolve.Candidate) string {
+	parts := make([]string, len(cands))
+	for i, c := range cands {
+		parts[i] = fmt.Sprintf("%s %d%%", record.EncodePath(c.Path), c.Score)
+	}
+	return "→ " + strings.Join(parts, " · ")
+}
+
+// renderExpansion writes an `r:#handle` block (§5.3): header with flags,
+// full body raw, follow evidence when inference ran, then links one level
+// and relations — the §4.3 structure glyphs.
 func renderExpansion(w io.Writer, e *view.Expansion) {
-	fmt.Fprintf(w, "%s [%s] #%s\n", record.EncodePath(e.Node), e.Subj, e.Handle)
+	fmt.Fprintf(w, "%s [%s] #%s%s\n", record.EncodePath(e.Node), e.Subj, e.Handle, flagSuffix(e.Flags))
 	fmt.Fprintln(w, e.Body)
+	if e.Vote != nil {
+		fmt.Fprintln(w, voteLine(e.Vote))
+	}
 	if len(e.Links) > 0 {
 		parts := make([]string, len(e.Links))
 		for i, ln := range e.Links {
@@ -112,4 +174,33 @@ func renderExpansion(w io.Writer, e *view.Expansion) {
 		}
 		fmt.Fprintf(w, "← linked-from: %s\n", strings.Join(parts, " · "))
 	}
+}
+
+// renderWorklist writes the hygiene report (§9.6): one line per entry
+// wanting judgment, evidence attached, and a count footer. Golden format
+// pinned by tests.
+func renderWorklist(w io.Writer, r *view.WorklistReport) {
+	for _, it := range r.Items {
+		fmt.Fprintf(w, "#%s %s %s", it.Handle, it.Subj, record.EncodePath(it.Path))
+		for _, reason := range it.Reasons {
+			switch reason {
+			case "split", "disputed":
+				fmt.Fprintf(w, " ⚠%s", reason)
+			default:
+				fmt.Fprintf(w, " %s", reason)
+			}
+		}
+		switch {
+		case it.Vote != nil:
+			fmt.Fprintf(w, " %s", voteLine(it.Vote))
+		case len(it.Runners) > 0:
+			fmt.Fprintf(w, " %s", runnersLine(it.Runners))
+		}
+		fmt.Fprintln(w)
+	}
+	if len(r.Items) == 0 {
+		fmt.Fprintln(w, "worklist clean")
+		return
+	}
+	fmt.Fprintf(w, "%d to review\n", len(r.Items))
 }

@@ -102,31 +102,32 @@ func TestReadYourWrites(t *testing.T) {
 	}
 }
 
-// TestKeepReAnchors replays §9.5's treatment: a drifted note (edit under
-// the anchor) leaves the M3 exact-layer surface; `k` re-blesses it at the
-// current blob with no new revision.
+// TestKeepReAnchors replays §9.5's treatment: an in-band drift (edit under
+// the anchor) surfaces flagged ⚠stale (§9.1 layer 3); `k` re-blesses it at
+// the current blob with no new revision.
 func TestKeepReAnchors(t *testing.T) {
 	r := NewRepo(t)
-	r.WriteFile("g.rb", "original\n")
+	body := "line one\nline two\nline three\nline four\nline five\nline six\n"
+	r.WriteFile("g.rb", body)
 	r.Commit("add g")
 	r.MustDM("", "init")
 	handle := createdHandle(t, r.MustDM("a:g.rb:c:About g\n").Stdout)
 
-	// Drift: the working blob no longer matches the anchor. Layer 1 (all
-	// M3 has) hides the note; similarity layers arrive M5.
-	r.WriteFile("g.rb", "edited\n")
-	if got := r.MustDM("r:g.rb\n").Stdout; !strings.Contains(got, "context: 0 own") {
-		t.Errorf("drifted read:\n%q\nwant empty surface under the exact layer", got)
+	// Drift within the §9.2 band: one line edited, the rest intact — the
+	// note stays visible at its path, flagged stale.
+	r.WriteFile("g.rb", strings.Replace(body, "line four\n", "line 4\n", 1))
+	if got := r.MustDM("r:g.rb\n").Stdout; !strings.Contains(got, "c #"+handle+" About g ⚠stale\n") {
+		t.Errorf("drifted read:\n%q\nwant the note flagged ⚠stale", got)
 	}
 
 	res := r.MustDM("k:#" + handle + "\n")
 	if !strings.Contains(res.Stdout, "✓ #"+handle+" re-anchored\n") {
 		t.Errorf("keep ack missing:\n%q", res.Stdout)
 	}
-	// Re-anchored to the dirty bytes: visible again, and still rev 1 — RA
+	// Re-anchored to the dirty bytes: fresh again, and still rev 1 — RA
 	// is not a revision (§7.1).
-	if got := r.MustDM("r:g.rb\n").Stdout; !strings.Contains(got, "c #"+handle+" About g\n") {
-		t.Errorf("read after k:\n%q\nwant the note back", got)
+	if got := r.MustDM("r:g.rb\n").Stdout; !strings.Contains(got, "c #"+handle+" About g\ncontext: 1 own") {
+		t.Errorf("read after k:\n%q\nwant the note back, unflagged", got)
 	}
 	res = r.MustDM("u:#" + handle + ":still rev two\n")
 	if !strings.Contains(res.Stdout, "superseded (rev 2)") {

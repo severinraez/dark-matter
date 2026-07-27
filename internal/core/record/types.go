@@ -45,6 +45,22 @@ type Path string
 // IsFolder reports whether the path names a folder (trailing slash).
 func (p Path) IsFolder() bool { return strings.HasSuffix(string(p), "/") }
 
+// RootFolder is the repo root as a folder path — the home of truly global
+// architecture notes (§3.4).
+const RootFolder Path = "./"
+
+// Under reports whether p lies inside folder (or is it): the recursive
+// folder-note scope (§3.2). The repo root contains every path.
+func (p Path) Under(folder Path) bool {
+	if !folder.IsFolder() {
+		return p == folder
+	}
+	if folder == RootFolder {
+		return true
+	}
+	return strings.HasPrefix(string(p), string(folder))
+}
+
 // Subject is the kind of knowledge a note carries (§3.3). The enum is
 // closed by design — no extensible fallback.
 type Subject string

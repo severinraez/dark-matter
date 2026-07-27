@@ -36,6 +36,16 @@ type Entry struct {
 	Path   record.Path
 	Body   string
 
+	// Origin is the origin commit stamped on the record that supplied the
+	// anchor — resolution's diff base (§9.1–§9.3): the write-time half of
+	// the two-point comparison.
+	Origin record.SHA
+
+	// PinnedPath: the newest landed path-affecting record is an explicit
+	// RP — the entry's path is agent-asserted, not confirmed, which is what
+	// arms resolution layer 4 (§9.1: pinned).
+	PinnedPath bool
+
 	// Rev is the revision the fold reads: CR = 1, each landed SU +1 (§7.1
 	// — RA/RP/TB are not revisions, so re-anchoring never inflates churn).
 	Rev int
@@ -112,8 +122,10 @@ func Fold(id record.EntryID, recs []record.Record, landed map[record.SHA]bool) E
 	}
 	if newestAnchor != nil {
 		e.Anchor = anchorOf(newestAnchor)
+		e.Origin = originOf(newestAnchor)
 	}
 	e.Path = pathOf(newestPath)
+	_, e.PinnedPath = newestPath.(record.RePath)
 	e.Disputed = disputed(sorted, guard)
 	return e
 }
@@ -154,6 +166,18 @@ func anchorOf(r record.Record) record.Anchor {
 		return v.Anchor
 	}
 	return record.Anchor{}
+}
+
+func originOf(r record.Record) record.SHA {
+	switch v := r.(type) {
+	case record.Create:
+		return v.Origin
+	case record.Supersede:
+		return v.Origin
+	case record.ReAnchor:
+		return v.Origin
+	}
+	return ""
 }
 
 func pathOf(r record.Record) record.Path {
