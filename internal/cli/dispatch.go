@@ -9,11 +9,10 @@ package cli
 import (
 	"fmt"
 	"io"
-	"strings"
-)
+	"os"
 
-// footerEnd is the end-marker glyph closing every batch stream (§4.3).
-const footerEnd = "◾"
+	"meltcloud.io/dm/internal/app"
+)
 
 const usage = `usage: dm [subcommand]
 
@@ -34,7 +33,15 @@ func Dispatch(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return runBatch(stdin, stdout, stderr)
 	}
 	switch args[0] {
-	case "init", "sync", "worklist", "gc", "dump":
+	case "init":
+		return run(stderr, func(det app.Determinism) error {
+			return app.Init(".", det, stdout)
+		})
+	case "dump":
+		return run(stderr, func(det app.Determinism) error {
+			return app.Dump(".", det, stdout, stderr)
+		})
+	case "sync", "worklist", "gc":
 		fmt.Fprintf(stderr, "dm %s: not implemented yet\n", args[0])
 		return 1
 	case "help", "-h", "--help":
@@ -46,16 +53,51 @@ func Dispatch(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 }
 
+// run resolves the determinism overrides and reports any failure on stderr.
+func run(stderr io.Writer, f func(app.Determinism) error) int {
+	det, err := app.DeterminismFromEnv(os.Getenv)
+	if err != nil {
+		fmt.Fprintf(stderr, "dm: %v\n", err)
+		return 1
+	}
+	if err := f(det); err != nil {
+		fmt.Fprintf(stderr, "dm: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// runBatch is the two-phase batch executor (§4.1): parse everything, reject
+// the whole batch on any syntax error, otherwise open a session and execute
+// in order.
 func runBatch(stdin io.Reader, stdout, stderr io.Writer) int {
 	data, err := io.ReadAll(stdin)
 	if err != nil {
 		fmt.Fprintf(stderr, "dm: reading stdin: %v\n", err)
 		return 1
 	}
-	if strings.TrimSpace(string(data)) == "" {
-		fmt.Fprintf(stdout, "%s0 ok\n", footerEnd)
+	cmds, perr := ParseBatch(string(data))
+	if perr != nil {
+		// Batch-level failure: a single ! line at the head of output,
+		// nothing applied (§4.4).
+		fmt.Fprintf(stdout, "!%s\n", perr)
+		return 1
+	}
+	if len(cmds) == 0 {
+		fmt.Fprintf(stdout, "%s0 ok\n", glyphEnd)
 		return 0
 	}
-	fmt.Fprintln(stderr, "dm: batch commands not implemented yet (arrives with M2)")
-	return 1
+	return run(stderr, func(det app.Determinism) error {
+		s, err := app.OpenSession(".", det, stderr)
+		if err != nil {
+			return err
+		}
+		defer s.Close()
+		res, err := s.ExecuteBatch(cmds)
+		if err != nil {
+			return err
+		}
+		renderBatch(stdout, res)
+		return nil
+	})
 }
