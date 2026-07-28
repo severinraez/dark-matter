@@ -27,10 +27,10 @@ func newDiscoveryRepo(t *testing.T) (*Repo, map[string]string) {
 
 	res := r.MustDM("a:api/handler.rb:d:bin/test runs handler specs\n" +
 		"a:api/handler.rb:c:Validates tenant header before dispatch\\\n" +
-			"and rejects missing tenants\\\n" +
-			"before any handler code runs\n" +
+		"and rejects missing tenants\\\n" +
+		"before any handler code runs\n" +
 		"a:api/:a:api reaches db only through repo/\\\n" +
-			"handlers never import models directly\n" +
+		"handlers never import models directly\n" +
 		"a:db/schema.rb:c:single-table inheritance for tenants\n" +
 		"al:$2:$4:tenant model background\n")
 	hs := createdHandles(t, res.Stdout)

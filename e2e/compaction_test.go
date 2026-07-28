@@ -28,7 +28,7 @@ func TestGCSweepsTombstonedEntryAndNothingElse(t *testing.T) {
 	a.MustDM("r:scratch.txt\n")
 	a.MustDM("f:#" + doomed + ":!:wrong\n")
 	a.MustDM("", "sync")
-	a.MustDM("d:#"+doomed+"\n")
+	a.MustDM("d:#" + doomed + "\n")
 	a.MustDM("", "sync")
 
 	pre := a.MustDM("", "dump").Stdout
@@ -121,7 +121,7 @@ func TestGCEpochNoResurrectionAndDanglingLateLanding(t *testing.T) {
 	b.MustDM("", "init")
 	b.MustDM("u:#" + doomed + ":Late revision from B\n")
 
-	a.MustDM("d:#"+doomed+"\n")
+	a.MustDM("d:#" + doomed + "\n")
 	a.MustDM("", "sync")
 	if got := a.MustDM("", "gc").Stdout; got != "compacted: dropped 1 records · 0 blobs · epoch 1\n" {
 		t.Fatalf("gc output %q", got)
@@ -187,7 +187,7 @@ func TestGCLandedVerdictSurvivesWhileOriginCarried(t *testing.T) {
 
 	// Tombstone the note: nothing carries the origin any more — the VD is
 	// droppable on the next sweep (TB lines pin no verdicts).
-	r.MustDM("d:#"+handle+"\n")
+	r.MustDM("d:#" + handle + "\n")
 	r.MustDM("", "sync")
 	if got := r.MustDM("", "gc").Stdout; got != "compacted: dropped 2 records · 0 blobs · epoch 2\n" {
 		t.Fatalf("second gc output %q", got)

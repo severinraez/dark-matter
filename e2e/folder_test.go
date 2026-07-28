@@ -273,3 +273,58 @@ func TestRootFolderNote(t *testing.T) {
 		t.Errorf("nested read:\n%q\nwant the root parent", got)
 	}
 }
+
+// TestFolderUncommittedRename replays §2.2 row 7: a folder renamed in
+// the working tree (staged, no commit) already carries its note at the
+// new path — as rows 4–6, no commit required first.
+func TestFolderUncommittedRename(t *testing.T) {
+	r := NewRepo(t)
+	seedFolder(r, "api", 3)
+	r.Commit("seed")
+	r.MustDM("", "init")
+	handle := createdHandle(t, r.MustDM("a:api/:a:place note\n").Stdout)
+
+	r.Git("mv", "api", "svc") // staged rename, no commit
+
+	got := r.MustDM("r:svc/\n").Stdout
+	if !strings.Contains(got, "a #"+handle+" place note\ncontext: 1 own") {
+		t.Errorf("read at the staged path:\n%q\nwant the note, fresh", got)
+	}
+	if got := r.MustDM("r:api/\n").Stdout; strings.Contains(got, "place note") {
+		t.Errorf("read at the old path:\n%q\nwant nothing", got)
+	}
+}
+
+// TestFolderScatterWorklistOnly replays §2.2 row 10: members scattered
+// across several folders with none clearly the successor — ambiguity,
+// surfaced on the worklist only (§9.3: scatter has nowhere to surface).
+func TestFolderScatterWorklistOnly(t *testing.T) {
+	r := NewRepo(t)
+	seedFolder(r, "api", 5)
+	r.Commit("seed")
+	r.MustDM("", "init")
+	handle := createdHandle(t, r.MustDM("a:api/:a:place note\n").Stdout)
+
+	// Five destinations at 20% each — every share below the §9.3 split
+	// candidate floor (25%), so nothing is even a candidate.
+	for i := 0; i < 5; i++ {
+		moveMembers(r, string(rune('v'+i)), i, i+1)
+	}
+	r.Commit("scatter")
+
+	// No candidate carries the note — scatter never surfaces on reads.
+	for _, p := range []string{"v/f0.rb", "w/f1.rb", "x/f2.rb"} {
+		if got := r.MustDM("r:" + p + "\n").Stdout; strings.Contains(got, handle) {
+			t.Errorf("read under %s:\n%q\nwant no scattered parent", p, got)
+		}
+	}
+	// The worklist carries it, and k with an explicit home repairs it.
+	wl := r.MustDM("", "worklist").Stdout
+	if !strings.Contains(wl, "#"+handle) || !strings.Contains(wl, "scattered") {
+		t.Fatalf("worklist:\n%q\nwant the scattered entry", wl)
+	}
+	r.MustDM("k:#" + handle + ":v/\n")
+	if got := r.MustDM("r:v/\n").Stdout; !strings.Contains(got, "a #"+handle+" place note\ncontext: 1 own") {
+		t.Errorf("read after re-home:\n%q\nwant fresh at v/", got)
+	}
+}

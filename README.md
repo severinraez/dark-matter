@@ -12,13 +12,16 @@ right commit, any merge strategy — queried through a token-efficient batch CLI
 - [architecture.md](architecture.md) — module boundaries, the Evidence port,
   core decomposition, repo layout (A§N references).
 - [plan.md](plan.md) — milestone ordering and dependency decisions.
-  **Current state: M6 (rule (b): lineage + ladder)** — every write verb
-  incl. `vd`, reads against store ∪ pending, full rule-(a) resolution
-  (layers 1–5, folder follow votes), `dm sync` with the §9.4 mint pass
-  (m1 reflog / m2 replay / m3 squash matchers, verdict records), derived
-  abandoned + the unreachability cache, and `dm worklist` with
-  abandoned-line grouping. Gate verdicts on record: [q1-report.md](q1-report.md),
+  **Current state: v1 complete (M9)** — the full §10.1 surface (batch
+  verbs incl. `vd`, `init`, `sync`, `dump`, `worklist`, `gc`), rule-(a)
+  resolution layers 1–5 with folder follow votes, the §9.4 matcher ladder
+  (m1 reflog / m2 replay / m3 squash) with verdict records, retrieval
+  ranking + search + stats, compaction, and the complete §11.4 scenario
+  matrix green. All three validation gates on record:
+  [q1-report.md](q1-report.md), [q2-report.md](q2-report.md),
   [q3-report.md](q3-report.md).
+- [agents-block.md](agents-block.md) — the canonical §10.3 block a
+  consuming repo copies into its own `AGENTS.md`.
 
 ## Build
 
@@ -58,8 +61,8 @@ by the batch's Nth command. Use a quoted heredoc (`<<'EOF'`) so the shell
 doesn't eat `\` continuations or `$N`. Notes live in `.git/.dm/pending`
 until `dm sync` folds them into the shared `refs/dm/store` branch
 (design.md §8); `dm worklist` lists what wants judgment (orphans, disputed
-notes, abandoned lines grouped for one-`vd` repair — §9.6); `s`, stats,
-and `gc` arrive with later milestones (plan.md M7+).
+notes, abandoned lines grouped for one-`vd` repair — §9.6); `s:path:terms`
+greps a node's note-context (§5.5) and `dm gc` compacts the store (§8.7).
 
 ## Develop
 
@@ -71,8 +74,11 @@ gofmt -l cmd internal e2e      # must print nothing
 ```
 
 The E2E harness (`e2e/`) builds the binary once per test process and drives it
-over stdin against inline-built git repos, pinning all nondeterminism via env
-overrides on the production binary (design.md §11.2):
+over stdin against inline-built git repos plus the seeded fixture repository
+(design.md §11.2) — assembled once per process by `cmd/dm-fixture`, a
+harness-owned, exec-only tool that drives the public `dm` interface from a
+declarative manifest (`cmd/dm-fixture/manifest.json`) and is never shipped.
+All nondeterminism is pinned via env overrides on the production binary:
 
 | env | effect |
 | --- | --- |
@@ -83,6 +89,13 @@ overrides on the production binary (design.md §11.2):
 When pinning both clock and seed across *multiple* invocations, vary them per
 invocation (the harness does) — identical seeded entropy replays identical
 entry-ids.
+
+The three §14 validation gates run on the same harness and scale via env:
+`TestQ1ReplaySynthetic`/`TestQ1ReplayRepo` (resolution under churn),
+`TestQ3PrecisionRecall` (`DM_Q3_ROUNDS` — landing precision/recall), and
+`TestQ2ReadPath` (`DM_Q2_SCALE`, plus per-axis `DM_Q2_*` overrides —
+read-path profiling). Verdicts: [q1-report.md](q1-report.md) ·
+[q2-report.md](q2-report.md) · [q3-report.md](q3-report.md).
 
 Layout follows architecture.md §9: pure core under `internal/core/`, adapters
 (`gitio`, `store`, `local`, `evcache`) beside it, use-case choreography in
